@@ -1,0 +1,17 @@
+# Private planning documents (never commit)
+PLAN.md
+STEPS.md
+CLAUDE.md
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+dist/
+.pytest_cache/
+
+# Local data and experiment artifacts
+data/
+mlruns/
+mlflow.db

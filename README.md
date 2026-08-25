@@ -1,0 +1,19 @@
+# Readmission Risk Scoring Service
+
+This is an MLOps pipeline that predicts 30-day hospital readmission risk, and is built to be operated long-term rather than just trained once. The service scores a continuous stream of patient encounters, monitors itself for drift and data failures, and ships model updates through an automated evaluation gate with shadow deployment and rollback.
+
+## The simulation boundary
+
+Everything here runs on synthetic data. Patients come from [Synthea](https://github.com/synthetichealth/synthea), which is a synthetic patient generator. There are no real users, no real traffic, and no protected health information anywhere in this repository. The model is a fixture whose job is to be observed under operation, and its performance numbers describe behavior on generator output, not clinical predictive skill. What the simulation does preserve are the properties that make production ML truly difficult at scale: data arrives continuously, ground-truth labels arrive 30 days late, failures appear unannounced, and every model change must prove itself against a live incumbent.
+
+## How it works
+
+A replay harness streams several years of generated patient encounters through a simulated clock running at 4 simulated days per real minute. Each qualifying inpatient discharge is scored by a FastAPI service that maintains per-patient historical features and logs every prediction with full provenance: model version, feature-pipeline version, input hash, and timestamp. Readmission labels are released exactly 30 simulated days after discharge, so monitoring must act on input and prediction drift before ground truth confirms it.
+
+A monitoring job evaluates drift on a rolling window and raises alerts. Failures are injected into the stream from a schedule that is encrypted and committed before any replay runs, so detection is scored against incidents chosen in advance rather than incidents the monitoring was tuned to catch. Alerts can trigger retraining; a candidate model must pass an evaluation gate and a shadow comparison against live replay traffic before it replaces the incumbent, and rollback restores the prior version.
+
+The stack is deliberately small: Docker Compose, Postgres, MLflow as the model registry, and Grafana for dashboards.
+
+## Current Status
+
+Very early in development. The repository does not yet contain a runnable service. Setup and replay instructions will be added to this README once the infrastructure falls into place.
