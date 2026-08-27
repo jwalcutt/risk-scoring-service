@@ -2,26 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import mlflow
 import pandas as pd
-import pytest
 from mlflow import MlflowClient
 
 from risk_scoring import tracking
-
-
-@pytest.fixture()
-def repo_root(tmp_path: Path) -> Iterator[Path]:
-    """A throwaway repo root; restores global MLflow URIs after the test."""
-    old_tracking = mlflow.get_tracking_uri()
-    old_registry = mlflow.get_registry_uri()
-    yield tmp_path
-    mlflow.set_tracking_uri(old_tracking)
-    mlflow.set_registry_uri(old_registry)
 
 
 def test_tracking_uri_is_sqlite_db_under_repo_root(tmp_path: Path) -> None:

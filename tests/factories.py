@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import csv
 from collections.abc import Iterable
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 PATIENT_DEFAULTS: dict[str, str] = {
@@ -122,3 +123,82 @@ def write_rows_csv(path: Path, rows: Iterable[dict[str, str]]) -> None:
         writer = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
         writer.writeheader()
         writer.writerows(rows)
+
+
+def iso_timestamp(moment: datetime) -> str:
+    """Format a datetime the way the Synthea encounter export does."""
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def write_training_csvs(csv_dir: Path) -> int:
+    """Synthetic population with a learnable signal; returns the cohort row count.
+
+    Forty adult patients each have one index inpatient stay well before the
+    cutoff. Even-numbered patients carry a prior emergency visit (the
+    signal) and an inpatient readmission 10 days after the index discharge;
+    the readmission stays are cohort rows themselves, so the pre-cutoff
+    cohort holds 60 rows. One extra patient discharges after the cutoff and
+    must be excluded. The signal is deterministic, so an honestly trained
+    model on this population scores near-perfect AUROC.
+    """
+    patients = []
+    encounters = []
+    for i in range(40):
+        pid = f"p{i:02d}"
+        patients.append(make_patient_row(Id=pid, BIRTHDATE="1960-01-01"))
+        index_start = datetime(2024, 3, 1, 8, 0, tzinfo=UTC) + timedelta(days=i)
+        index_stop = index_start + timedelta(days=3)
+        encounters.append(
+            make_encounter_row(
+                Id=f"e-index-{pid}",
+                PATIENT=pid,
+                ENCOUNTERCLASS="inpatient",
+                START=iso_timestamp(index_start),
+                STOP=iso_timestamp(index_stop),
+            )
+        )
+        if i % 2 == 0:
+            ed_visit = index_start - timedelta(days=30)
+            encounters.append(
+                make_encounter_row(
+                    Id=f"e-ed-{pid}",
+                    PATIENT=pid,
+                    ENCOUNTERCLASS="emergency",
+                    START=iso_timestamp(ed_visit),
+                    STOP=iso_timestamp(ed_visit + timedelta(hours=4)),
+                )
+            )
+            readmit_start = index_stop + timedelta(days=10)
+            encounters.append(
+                make_encounter_row(
+                    Id=f"e-readmit-{pid}",
+                    PATIENT=pid,
+                    ENCOUNTERCLASS="inpatient",
+                    START=iso_timestamp(readmit_start),
+                    STOP=iso_timestamp(readmit_start + timedelta(days=2)),
+                )
+            )
+
+    patients.append(make_patient_row(Id="p-late", BIRTHDATE="1960-01-01"))
+    encounters.append(
+        make_encounter_row(
+            Id="e-late",
+            PATIENT="p-late",
+            ENCOUNTERCLASS="inpatient",
+            START="2025-01-30T08:00:00Z",
+            STOP="2025-02-02T08:00:00Z",
+        )
+    )
+
+    csv_dir.mkdir(parents=True, exist_ok=True)
+    write_rows_csv(csv_dir / "patients.csv", patients)
+    write_rows_csv(csv_dir / "encounters.csv", encounters)
+    write_rows_csv(
+        csv_dir / "medications.csv",
+        [make_medication_row(PATIENT="p00", ENCOUNTER="e-index-p00")],
+    )
+    write_rows_csv(
+        csv_dir / "conditions.csv",
+        [make_condition_row(PATIENT="p00", ENCOUNTER="e-index-p00")],
+    )
+    return 60
