@@ -15,3 +15,6 @@ dist/
 data/
 mlruns/
 mlflow.db
+
+# Synthea release jar (pinned by URL + checksum in configs/generation.toml)
+tools/synthea/

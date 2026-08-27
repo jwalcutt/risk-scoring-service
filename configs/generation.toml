@@ -1,0 +1,37 @@
+# Generation config for the frozen Synthea populations.
+#
+# Committed before any population is generated, so the seed, reference date,
+# population size, and geography are fixed in the public history first.
+# jar_sha256 is recorded on first download of the pinned release asset.
+
+[synthea]
+version = "v4.0.0"
+jar_url = "https://github.com/synthetichealth/synthea/releases/download/v4.0.0/synthea-with-dependencies.jar"
+jar_sha256 = ""
+jar_path = "tools/synthea/synthea-with-dependencies.jar"
+
+[generation]
+seed = 20260101
+clinician_seed = 20260101
+reference_date = "20260101"
+population_size = 10000
+state = "Massachusetts"
+
+[exporter]
+"exporter.csv.export" = "true"
+"exporter.fhir.export" = "false"
+"exporter.hospital.fhir.export" = "false"
+"exporter.practitioner.fhir.export" = "false"
+"exporter.years_of_history" = "10"
+
+# The baseline population uses the parameters above unmodified.
+[populations.baseline]
+
+# Statistically comparable population generated with a locally modified
+# hypertension module (medication-regimen change) overriding the built-in.
+[populations.care_protocol]
+modules_dir = "synthea_modules/care_protocol"
+
+# Statistically comparable population with an older age mix.
+[populations.demographic_shift]
+age_range = "55-100"
