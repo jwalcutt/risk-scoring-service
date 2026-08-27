@@ -39,15 +39,16 @@ addopts = "-q"
 
 [tool.ruff]
 line-length = 100
-src = ["src", "tests"]
+src = ["src", "tests", "scripts"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
 
 [tool.mypy]
 strict = true
-files = ["src"]
-mypy_path = "src"
+files = ["src", "scripts"]
+# tests is on the path so scripts can resolve the test factories they reuse.
+mypy_path = "src:tests"
 
 # scikit-learn ships no py.typed marker, so its symbols resolve to Any.
 # Scoped to sklearn only; every other import stays strictly checked.

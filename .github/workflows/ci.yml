@@ -23,13 +23,24 @@ jobs:
         run: uv sync --locked
 
       - name: Lint (ruff check)
-        run: uv run ruff check src tests
+        run: uv run ruff check src tests scripts
 
       - name: Format check (ruff format)
-        run: uv run ruff format --check src tests
+        run: uv run ruff format --check src tests scripts
 
       - name: Type check (mypy)
-        run: uv run mypy src
+        run: uv run mypy src scripts
 
       - name: Test (pytest)
         run: uv run pytest
+
+      - name: Evaluation gate (synthetic population)
+        run: uv run python scripts/run_gate_ci.py --report gate_report.md
+
+      - name: Upload gate report
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: gate-report
+          path: gate_report.md
+          if-no-files-found: ignore
