@@ -28,6 +28,14 @@ python -m risk_scoring.datagen generate all
 
 `python -m risk_scoring.datagen verify` checks local data against the committed manifests, and `sanity` prints summary statistics for a population.
 
+## Model registry
+
+Trained models are versioned in MLflow, backed by a SQLite database at the repository root (`mlflow.db`) with run artifacts under `mlruns/`. Both stay local and out of git. Training code points MLflow at this store through the `risk_scoring.tracking` module, and the UI serves against the same store:
+
+```bash
+python -m risk_scoring.tracking ui
+```
+
 ## Current Status
 
-Very early in development. The data spine exists (frozen synthetic populations plus verification tooling), but the repository does not yet contain a runnable service. Setup and replay instructions will be added to this README once the infrastructure falls into place.
+Very early in development. The data spine exists (frozen synthetic populations plus verification tooling) and the MLflow model registry is wired up, but the repository does not yet contain a runnable service. Setup and replay instructions will be added to this README once the infrastructure falls into place.
