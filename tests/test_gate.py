@@ -18,11 +18,22 @@ The rules these tests pin:
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from pathlib import Path
+
+import lightgbm as lgb
+import mlflow
 import numpy as np
 import numpy.typing as npt
 import pandas as pd
+import pytest
+from mlflow import MlflowClient
 
-from risk_scoring import gate
+from factories import write_gate_population, write_leak_population, write_training_csvs
+from risk_scoring import gate, train
+from risk_scoring.cohort import build_cohort
+from risk_scoring.features import FEATURE_COLUMNS, build_features
+from risk_scoring.labels import build_labels
 
 # --- deterministic fixtures ---
 
@@ -248,5 +259,156 @@ def test_render_report_headlines_leakage_on_ceiling_breach() -> None:
         seed=20260101,
     )
 
+    assert "FAIL" in report
+    assert "SUSPECTED LEAKAGE" in report
+
+
+# --- end to end against a trained, registered model ---
+
+
+@pytest.fixture(scope="module")
+def trained_repo(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[Path, Path, train.TrainingResult]]:
+    """One gate population trained and registered once for this module."""
+    old_tracking = mlflow.get_tracking_uri()
+    old_registry = mlflow.get_registry_uri()
+    root = tmp_path_factory.mktemp("gate-repo")
+    csv_dir = root / "data" / "baseline" / "csv"
+    write_gate_population(csv_dir)
+    result = train.train(csv_dir, root)
+    yield root, csv_dir, result
+    mlflow.set_tracking_uri(old_tracking)
+    mlflow.set_registry_uri(old_registry)
+
+
+def test_gate_end_to_end_passes_and_logs_mlflow_run(
+    trained_repo: tuple[Path, Path, train.TrainingResult],
+) -> None:
+    root, csv_dir, trained = trained_repo
+    report_path = root / "gate_report.md"
+
+    outcome = gate.run_gate(csv_dir, root, report_path=report_path)
+    result = outcome.result
+
+    assert outcome.model_version == trained.model_version
+    assert result.verdict == "pass"
+    repro = next(c for c in result.checks if c.name == "holdout_reproduced")
+    assert repro.passed
+    assert len(result.subgroups) == 13
+
+    client = MlflowClient()
+    experiment = mlflow.get_experiment_by_name("readmission-risk")
+    assert experiment is not None
+    gate_runs = client.search_runs([experiment.experiment_id], "tags.run_type = 'gate'")
+    assert len(gate_runs) >= 1
+    gate_run = gate_runs[0]
+    assert gate_run.data.tags["candidate_run_id"] == trained.run_id
+    assert gate_run.data.tags["candidate_model_version"] == str(trained.model_version)
+    assert gate_run.data.tags["gate_verdict"] == "pass"
+    assert gate_run.data.metrics["gate_auroc"] == pytest.approx(result.auroc.value)
+    assert gate_run.data.metrics["gate_ece"] == pytest.approx(result.ece.value)
+    artifact_paths = [a.path for a in client.list_artifacts(gate_run.info.run_id)]
+    assert "gate_report.md" in artifact_paths
+
+    version = client.get_model_version(train.MODEL_NAME, str(trained.model_version))
+    assert version.tags["gate_verdict"] == "pass"
+    assert version.tags["gate_run_id"] == gate_run.info.run_id
+
+    report = report_path.read_text()
+    assert "PASS" in report
+    assert trained.run_id in report
+
+
+def test_cli_run_gates_registered_model_and_prints_report(
+    trained_repo: tuple[Path, Path, train.TrainingResult],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root, _, _ = trained_repo
+    monkeypatch.chdir(root)
+
+    gate.main(["run"])
+
+    out = capsys.readouterr().out
+    assert "PASS" in out
+    assert "gate_auroc" not in out  # report is markdown prose, not raw metric keys
+
+
+def test_cli_exits_nonzero_on_failing_gate(
+    repo_root: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The deterministic training population separates perfectly, so the
+    # honest model lands above the band ceiling and the gate must fail.
+    csv_dir = repo_root / "data" / "baseline" / "csv"
+    write_training_csvs(csv_dir)
+    train.train(csv_dir, repo_root)
+    monkeypatch.chdir(repo_root)
+
+    with pytest.raises(SystemExit) as excinfo:
+        gate.main(["run"])
+
+    assert excinfo.value.code == 1
+    assert "FAIL" in capsys.readouterr().out
+
+
+# --- the required negative test: leaked patient splits ---
+
+
+def test_leaked_split_candidate_is_flagged_loudly(tmp_path: Path) -> None:
+    """A candidate trained on a row-level (patient-leaking) split must fail.
+
+    The leak population carries no cross-patient signal at all: outcomes
+    are a per-patient coin. Any discrimination a row-split candidate
+    shows on its holdout is memorized through patients it already saw in
+    training, and the gate must flag the inflated score loudly.
+    """
+    csv_dir = tmp_path / "csv"
+    write_leak_population(csv_dir)
+    encounters = pd.read_csv(csv_dir / "encounters.csv", dtype=str, keep_default_na=False)
+    patients = pd.read_csv(csv_dir / "patients.csv", dtype=str, keep_default_na=False)
+    medications = pd.read_csv(csv_dir / "medications.csv", dtype=str, keep_default_na=False)
+    conditions = pd.read_csv(csv_dir / "conditions.csv", dtype=str, keep_default_na=False)
+    cohort = build_cohort(encounters, patients).frame
+    labels = build_labels(cohort, encounters)
+    features = build_features(cohort, encounters, medications, conditions)
+    x = features.loc[:, list(FEATURE_COLUMNS[2:])].astype("float64")
+    y = labels["label"].to_numpy(dtype=float)
+
+    # Deliberately broken: rows are shuffled and split with no patient
+    # grouping, so most evaluation patients also appear in training.
+    positions = np.random.default_rng(20260101).permutation(len(x))
+    split_at = int(len(positions) * 0.8)
+    train_idx, holdout_idx = positions[:split_at], positions[split_at:]
+    leaked = set(features["patient_id"].iloc[train_idx]) & set(
+        features["patient_id"].iloc[holdout_idx]
+    )
+    assert leaked  # the split really does leak patients
+
+    booster = lgb.train(
+        train.LGBM_PARAMS,
+        lgb.Dataset(x.iloc[train_idx], label=y[train_idx]),
+        num_boost_round=train.NUM_BOOST_ROUND,
+    )
+    scores = np.asarray(booster.predict(x.iloc[holdout_idx]), dtype=float)
+
+    result = gate.evaluate(
+        scores, y[holdout_idx], features["patient_id"].iloc[holdout_idx], n_replicates=100
+    )
+
+    assert result.verdict == "fail"
+    ceiling = next(c for c in result.checks if c.name == "auroc_below_band_ceiling")
+    assert not ceiling.passed
+    assert result.auroc.value > 0.92
+    assert "SUSPECTED LEAKAGE" in ceiling.detail
+
+    report = gate.render_report(
+        result,
+        model_version=99,
+        candidate_run_id="run-leaked",
+        data_dir=str(csv_dir),
+        cutoff="2025-01-01",
+        seed=20260101,
+    )
     assert "FAIL" in report
     assert "SUSPECTED LEAKAGE" in report

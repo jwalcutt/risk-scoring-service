@@ -25,26 +25,33 @@ Judgment calls this module fixes:
 
 from __future__ import annotations
 
+import argparse
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 
+import mlflow
 import numpy as np
 import numpy.typing as npt
 import pandas as pd
+from mlflow import MlflowClient
 from sklearn.metrics import average_precision_score, brier_score_loss, roc_auc_score
 
-from risk_scoring.cohort import COHORT_VERSION
+from risk_scoring.cohort import COHORT_VERSION, build_cohort
 from risk_scoring.evaluation import (
     BOOTSTRAP_REPLICATES,
     BOOTSTRAP_SEED,
+    ECE_BINS,
     CalibrationBin,
     MetricCI,
     bootstrap_ci,
     calibration_bins,
     expected_calibration_error,
 )
-from risk_scoring.features import FEATURE_VERSION
-from risk_scoring.labels import LABEL_VERSION
-from risk_scoring.train import MODEL_NAME, SIGNAL_BAND
+from risk_scoring.features import FEATURE_COLUMNS, FEATURE_VERSION, build_features
+from risk_scoring.labels import LABEL_VERSION, build_labels
+from risk_scoring.tracking import configure_tracking
+from risk_scoring.train import MODEL_NAME, SIGNAL_BAND, filter_training_window, grouped_split
 
 ECE_THRESHOLD = 0.05
 
@@ -357,3 +364,173 @@ def render_report(
             )
     lines.append("")
     return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class GateRunOutcome:
+    """What one gate execution produced, for the CLI and for tests."""
+
+    result: GateResult
+    report: str
+    model_version: int
+    candidate_run_id: str
+    gate_run_id: str
+
+
+def _resolve_model_version(client: MlflowClient, model_version: int | None) -> int:
+    versions = [int(v.version) for v in client.search_model_versions(f"name = '{MODEL_NAME}'")]
+    if not versions:
+        raise ValueError(f"no registered versions of {MODEL_NAME}; train a model first")
+    if model_version is None:
+        return max(versions)
+    if model_version not in versions:
+        raise ValueError(f"{MODEL_NAME} has no version {model_version}; found {sorted(versions)}")
+    return model_version
+
+
+def run_gate(
+    csv_dir: Path,
+    repo_root: Path,
+    *,
+    model_version: int | None = None,
+    report_path: Path | None = None,
+) -> GateRunOutcome:
+    """Gate one registered model version against its re-derived holdout.
+
+    The holdout is rebuilt from the raw CSVs with the split seed, holdout
+    fraction, and cutoff read from the model version's own training run,
+    so the gate cannot drift from what training did; the reproduction
+    check confirms the rebuilt holdout scores exactly what training
+    logged. Results are written to a new MLflow run tagged run_type=gate
+    and onto the model version itself, never onto the finished training
+    run.
+    """
+    configure_tracking(repo_root)
+    client = MlflowClient()
+    version = _resolve_model_version(client, model_version)
+    registered = client.get_model_version(MODEL_NAME, str(version))
+    candidate_run_id = registered.run_id or ""
+    training_run = client.get_run(candidate_run_id)
+    cutoff = pd.Timestamp(training_run.data.params["training_cutoff"], tz="UTC")
+    seed = int(training_run.data.params["split_seed"])
+    holdout_fraction = float(training_run.data.params["holdout_fraction"])
+    expected_auroc = training_run.data.metrics["holdout_auroc"]
+
+    encounters = pd.read_csv(csv_dir / "encounters.csv", dtype=str, keep_default_na=False)
+    patients = pd.read_csv(csv_dir / "patients.csv", dtype=str, keep_default_na=False)
+    medications = pd.read_csv(csv_dir / "medications.csv", dtype=str, keep_default_na=False)
+    conditions = pd.read_csv(csv_dir / "conditions.csv", dtype=str, keep_default_na=False)
+
+    cohort = filter_training_window(build_cohort(encounters, patients).frame, cutoff)
+    labels = build_labels(cohort, encounters)
+    features = build_features(cohort, encounters, medications, conditions)
+    x = features.loc[:, list(FEATURE_COLUMNS[2:])].astype("float64")
+    y = labels["label"].to_numpy(dtype=float)
+    _, holdout_idx = grouped_split(features["patient_id"], holdout_fraction, seed)
+
+    features_holdout = features.iloc[holdout_idx].reset_index(drop=True)
+    model = mlflow.pyfunc.load_model(f"models:/{MODEL_NAME}/{version}")
+    scores = np.asarray(model.predict(x.iloc[holdout_idx]), dtype=float)
+
+    result = evaluate(
+        scores,
+        y[holdout_idx],
+        features_holdout["patient_id"],
+        build_subgroups(features_holdout, patients),
+        expected_auroc=expected_auroc,
+    )
+    report = render_report(
+        result,
+        model_version=version,
+        candidate_run_id=candidate_run_id,
+        data_dir=str(csv_dir),
+        cutoff=cutoff.date().isoformat(),
+        seed=seed,
+    )
+
+    with mlflow.start_run() as gate_run:
+        mlflow.set_tags(
+            {
+                "run_type": "gate",
+                "candidate_run_id": candidate_run_id,
+                "candidate_model_version": str(version),
+                "gate_verdict": result.verdict,
+            }
+        )
+        mlflow.log_params(
+            {
+                "model_name": MODEL_NAME,
+                "model_version": version,
+                "data_dir": str(csv_dir),
+                "training_cutoff": cutoff.date().isoformat(),
+                "split_seed": seed,
+                "holdout_fraction": holdout_fraction,
+                "bootstrap_replicates": BOOTSTRAP_REPLICATES,
+                "bootstrap_seed": BOOTSTRAP_SEED,
+                "ece_bins": ECE_BINS,
+            }
+        )
+        metrics = {
+            "gate_auroc": result.auroc.value,
+            "gate_auroc_ci_low": result.auroc.ci_low,
+            "gate_auroc_ci_high": result.auroc.ci_high,
+            "gate_pr_auc": result.pr_auc.value,
+            "gate_pr_auc_ci_low": result.pr_auc.ci_low,
+            "gate_pr_auc_ci_high": result.pr_auc.ci_high,
+            "gate_ece": result.ece.value,
+            "gate_ece_ci_low": result.ece.ci_low,
+            "gate_ece_ci_high": result.ece.ci_high,
+            "gate_brier": result.brier.value,
+            "gate_brier_ci_low": result.brier.ci_low,
+            "gate_brier_ci_high": result.brier.ci_high,
+            "gate_n_rows": float(result.n_rows),
+            "gate_n_patients": float(result.n_patients),
+            "gate_prevalence": result.prevalence,
+        }
+        for subgroup in result.subgroups:
+            if subgroup.auroc is not None:
+                metrics[f"gate_subgroup_auroc__{subgroup.name}"] = subgroup.auroc
+        mlflow.log_metrics(metrics)
+        mlflow.log_text(report, "gate_report.md")
+        gate_run_id = gate_run.info.run_id
+
+    client.set_model_version_tag(MODEL_NAME, str(version), "gate_verdict", result.verdict)
+    client.set_model_version_tag(MODEL_NAME, str(version), "gate_run_id", gate_run_id)
+
+    if report_path is not None:
+        report_path.write_text(report)
+    return GateRunOutcome(
+        result=result,
+        report=report,
+        model_version=version,
+        candidate_run_id=candidate_run_id,
+        gate_run_id=gate_run_id,
+    )
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(
+        prog="python -m risk_scoring.gate",
+        description="Gate a registered readmission model against its holdout.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+    run_parser = sub.add_parser("run", help="gate a registered model version")
+    run_parser.add_argument("--population", default="baseline")
+    run_parser.add_argument("--model-version", type=int, default=None)
+    run_parser.add_argument("--report", type=Path, default=None)
+    args = parser.parse_args(argv)
+
+    repo_root = Path.cwd()
+    csv_dir = repo_root / "data" / args.population / "csv"
+    if not csv_dir.is_dir():
+        sys.exit(f"no CSV export at {csv_dir}; generate the population first")
+    outcome = run_gate(
+        csv_dir, repo_root, model_version=args.model_version, report_path=args.report
+    )
+    print(outcome.report)
+    if outcome.result.verdict != "pass":
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
