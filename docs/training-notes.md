@@ -25,3 +25,7 @@ The model is registered as version 1 of `readmission-risk` (MLflow run `aa20db08
 ## Band verdict
 
 The held-out patient-grouped AUROC of 0.8617 lands inside the band of 0.65 to 0.92 that [signal-band.md](signal-band.md) committed before any training run, so neither fallback applies and no leakage disclosure is triggered. The score sits in the upper half of the band, which is consistent with Synthea's documented tendency toward clean, rule-driven histories, but it stays below the 0.92 ceiling that would mark suspected generator leakage. The number describes discrimination on generator output and carries no clinical meaning.
+
+## Gate verdict
+
+Version 1 passed the evaluation gate ([gate-notes.md](gate-notes.md)) on 2026-08-27, MLflow gate run `911bbf950a9643eb83a5d5f30989d732`. Every check passed: AUROC 0.8617 with a 95% patient-bootstrap interval of [0.8087, 0.9103], expected calibration error 0.0371 [0.0195, 0.0589], Brier score 0.0838 [0.0550, 0.1100], and an exact reproduction of the training run's logged holdout score. The subgroup table recorded near-chance discrimination for patients with the heart-failure flag (AUROC 0.48 on 85 holdout rows) and a below-average 0.73 in the 65-to-79 age band; subgroups are report-only, so neither affects the verdict, and both numbers are kept here as honest context for later monitoring.

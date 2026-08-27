@@ -54,6 +54,16 @@ python -m risk_scoring.train run --population baseline
 
 Training uses only discharges that end before a fixed cutoff date (2025-01-01 by default), which reserves the most recent year of generated history for replay and guarantees every training label had time to mature. Evaluation runs on a patient-grouped holdout, so no patient appears on both sides of the split and the reported AUROC measures generalization to unseen patients. Each run logs the cohort, feature, and label versions, the cutoff, the split seed, holdout discrimination and prevalence metrics, and the model itself as a new version of `readmission-risk` in the MLflow registry. The pre-registered range the held-out AUROC is judged against, and what happens when a result lands outside it, are recorded in [docs/signal-band.md](docs/signal-band.md).
 
+## Evaluation gate
+
+Before a registered model can serve traffic it must pass the evaluation gate:
+
+```bash
+python -m risk_scoring.gate run --population baseline --report gate_report.md
+```
+
+The gate rebuilds the model's patient-grouped holdout from raw generator output, using the split parameters logged on that model's own training run, and judges it against fixed criteria: held-out AUROC inside the pre-registered signal band, expected calibration error at most 0.05, and an exact reproduction of the training run's logged holdout score. A score above the band ceiling fails loudly as suspected leakage; a test proves this by training a candidate on a deliberately leaked patient split and confirming the gate flags the inflated score. Every metric carries a bootstrap confidence interval resampled at the patient level, and the report breaks results down by age band, sex, and comorbidity flag. Results land in MLflow as a tagged gate run with the full report attached, and the gated model version is tagged with its verdict. CI runs the gate end to end on a synthetic population and fails on a failing verdict. Criteria and method are documented in [docs/gate-notes.md](docs/gate-notes.md).
+
 ## Current Status
 
-Early in development. The data spine exists (frozen synthetic populations plus verification tooling), the cohort, feature, and label layers are implemented and tested, and the first model is trained and registered in the MLflow registry, with its held-out results recorded in [docs/training-notes.md](docs/training-notes.md). The repository does not yet contain a runnable service; setup and replay instructions will be added to this README once the infrastructure falls into place.
+Early in development. The data spine exists (frozen synthetic populations plus verification tooling), the cohort, feature, and label layers are implemented and tested, and the first model is trained, registered in the MLflow registry, and passed through the evaluation gate, with results recorded in [docs/training-notes.md](docs/training-notes.md) and [docs/gate-notes.md](docs/gate-notes.md). The repository does not yet contain a runnable service; setup and replay instructions will be added to this README once the infrastructure falls into place.
