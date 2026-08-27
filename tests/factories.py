@@ -63,6 +63,33 @@ ENCOUNTER_DEFAULTS: dict[str, str] = {
 }
 
 
+MEDICATION_DEFAULTS: dict[str, str] = {
+    "START": "2024-01-01T08:00:00Z",
+    "STOP": "2024-01-08T08:00:00Z",
+    "PATIENT": "patient-1",
+    "PAYER": "payer-1",
+    "ENCOUNTER": "encounter-1",
+    "CODE": "308136",
+    "DESCRIPTION": "amLODIPine 2.5 MG Oral Tablet",
+    "BASE_COST": "0.00",
+    "PAYER_COVERAGE": "0.00",
+    "DISPENSES": "1",
+    "TOTALCOST": "0.00",
+    "REASONCODE": "",
+    "REASONDESCRIPTION": "",
+}
+
+CONDITION_DEFAULTS: dict[str, str] = {
+    "START": "2024-01-01",
+    "STOP": "2024-01-08",
+    "PATIENT": "patient-1",
+    "ENCOUNTER": "encounter-1",
+    "SYSTEM": "SNOMED-CT",
+    "CODE": "444814009",
+    "DESCRIPTION": "Viral sinusitis (disorder)",
+}
+
+
 def _build(defaults: dict[str, str], overrides: dict[str, str]) -> dict[str, str]:
     unknown = set(overrides) - set(defaults)
     if unknown:
@@ -76,6 +103,14 @@ def make_patient_row(**overrides: str) -> dict[str, str]:
 
 def make_encounter_row(**overrides: str) -> dict[str, str]:
     return _build(ENCOUNTER_DEFAULTS, overrides)
+
+
+def make_medication_row(**overrides: str) -> dict[str, str]:
+    return _build(MEDICATION_DEFAULTS, overrides)
+
+
+def make_condition_row(**overrides: str) -> dict[str, str]:
+    return _build(CONDITION_DEFAULTS, overrides)
 
 
 def write_rows_csv(path: Path, rows: Iterable[dict[str, str]]) -> None:

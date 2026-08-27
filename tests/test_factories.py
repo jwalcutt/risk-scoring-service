@@ -9,7 +9,13 @@ from pathlib import Path
 
 import pytest
 
-from factories import make_encounter_row, make_patient_row, write_rows_csv
+from factories import (
+    make_condition_row,
+    make_encounter_row,
+    make_medication_row,
+    make_patient_row,
+    write_rows_csv,
+)
 
 REAL_PATIENT_HEADER = (
     "Id,BIRTHDATE,DEATHDATE,SSN,DRIVERS,PASSPORT,PREFIX,FIRST,MIDDLE,LAST,SUFFIX,"
@@ -21,6 +27,11 @@ REAL_ENCOUNTER_HEADER = (
     "DESCRIPTION,BASE_ENCOUNTER_COST,TOTAL_CLAIM_COST,PAYER_COVERAGE,REASONCODE,"
     "REASONDESCRIPTION"
 )
+REAL_MEDICATION_HEADER = (
+    "START,STOP,PATIENT,PAYER,ENCOUNTER,CODE,DESCRIPTION,BASE_COST,PAYER_COVERAGE,"
+    "DISPENSES,TOTALCOST,REASONCODE,REASONDESCRIPTION"
+)
+REAL_CONDITION_HEADER = "START,STOP,PATIENT,ENCOUNTER,SYSTEM,CODE,DESCRIPTION"
 
 
 def test_patient_row_keys_match_real_header_in_order() -> None:
@@ -31,6 +42,16 @@ def test_patient_row_keys_match_real_header_in_order() -> None:
 def test_encounter_row_keys_match_real_header_in_order() -> None:
     row = make_encounter_row()
     assert list(row.keys()) == REAL_ENCOUNTER_HEADER.split(",")
+
+
+def test_medication_row_keys_match_real_header_in_order() -> None:
+    row = make_medication_row()
+    assert list(row.keys()) == REAL_MEDICATION_HEADER.split(",")
+
+
+def test_condition_row_keys_match_real_header_in_order() -> None:
+    row = make_condition_row()
+    assert list(row.keys()) == REAL_CONDITION_HEADER.split(",")
 
 
 def test_overrides_are_applied() -> None:

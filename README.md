@@ -36,6 +36,12 @@ Trained models are versioned in MLflow, backed by a SQLite database at the repos
 python -m risk_scoring.tracking ui
 ```
 
+## Cohort and features
+
+Scoring targets adult inpatient discharges. The cohort module (`risk_scoring.cohort`) selects them from raw generator output, excluding in-hospital deaths and patients under 18 at discharge, and reports exclusion counts for every run alongside its `COHORT_VERSION`.
+
+The feature module (`risk_scoring.features`) computes one row per discharge, as of the discharge timestamp. The features are age, length of stay, inpatient and emergency visit counts over the prior 180 days, days since the previous discharge capped at 365, active medication and chronic condition counts, and seven comorbidity flags (heart failure, chronic pulmonary disease, dementia, diabetes, malignancy, myocardial infarction, chronic kidney disease) from curated code lists. No feature reads anything recorded after the scoring discharge, and the module docstring records each point-in-time rule. The same module serves both training and live scoring, and `FEATURE_VERSION` is logged with every prediction so scores are traceable to the feature definitions that produced them.
+
 ## Current Status
 
-Very early in development. The data spine exists (frozen synthetic populations plus verification tooling) and the MLflow model registry is wired up, but the repository does not yet contain a runnable service. Setup and replay instructions will be added to this README once the infrastructure falls into place.
+Very early in development. The data spine exists (frozen synthetic populations plus verification tooling), the MLflow model registry is wired up, and the cohort and feature layers are implemented and tested, but the repository does not yet contain a runnable service. Setup and replay instructions will be added to this README once the infrastructure falls into place.
