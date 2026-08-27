@@ -56,4 +56,4 @@ Training uses only discharges that end before a fixed cutoff date (2025-01-01 by
 
 ## Current Status
 
-Very early in development. The data spine exists (frozen synthetic populations plus verification tooling), the MLflow model registry is wired up, and the cohort and feature layers are implemented and tested, but the repository does not yet contain a runnable service. Setup and replay instructions will be added to this README once the infrastructure falls into place.
+Early in development. The data spine exists (frozen synthetic populations plus verification tooling), the cohort, feature, and label layers are implemented and tested, and the first model is trained and registered in the MLflow registry, with its held-out results recorded in [docs/training-notes.md](docs/training-notes.md). The repository does not yet contain a runnable service; setup and replay instructions will be added to this README once the infrastructure falls into place.
