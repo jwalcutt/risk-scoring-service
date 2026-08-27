@@ -1,0 +1,113 @@
+{
+  "config": {
+    "age_range": null,
+    "clinician_seed": 20260101,
+    "exporter": {
+      "exporter.csv.export": "true",
+      "exporter.fhir.export": "false",
+      "exporter.hospital.fhir.export": "false",
+      "exporter.practitioner.fhir.export": "false",
+      "exporter.years_of_history": "10"
+    },
+    "jar_sha256": "ed43c20ad40ba5c3bc724503a5af032715fe3c491620b766148e7c2361e6ecc1",
+    "modules_dir": "synthea_modules/care_protocol",
+    "population": "care_protocol",
+    "population_size": 10000,
+    "reference_date": "20260101",
+    "seed": 20260101,
+    "state": "Massachusetts",
+    "synthea_version": "v4.0.0"
+  },
+  "files": {
+    "allergies.csv": {
+      "bytes": 1851835,
+      "rows": 10389,
+      "sha256": "2a563f470f517af6bf0d75cda86b796d1bd924ee4f1a798a45fe23ebe1ec6c7c"
+    },
+    "careplans.csv": {
+      "bytes": 7778621,
+      "rows": 38810,
+      "sha256": "01016467aa2165da481e03e4efde49e329748742aafaa86f62c54dc330634b70"
+    },
+    "claims.csv": {
+      "bytes": 500016871,
+      "rows": 1299195,
+      "sha256": "07287db9b21b706c2f818082ee8171b3436d025c5804fed65ca3647674c299d2"
+    },
+    "claims_transactions.csv": {
+      "bytes": 4387542954,
+      "rows": 9665070,
+      "sha256": "fa5fa7028d1e158feae3f086d624ddc619fe83910dea9b2767c7aba54877a2e2"
+    },
+    "conditions.csv": {
+      "bytes": 59527266,
+      "rows": 413104,
+      "sha256": "3881b266768582cfd5c779479a33dbf56a423d15d366a26be16a3f500d54eb76"
+    },
+    "devices.csv": {
+      "bytes": 4234633,
+      "rows": 18706,
+      "sha256": "59a9e43d0dd20d451af2995f0ff0eab908513ef2289c33613fb656d2c3ba589a"
+    },
+    "encounters.csv": {
+      "bytes": 237110844,
+      "rows": 713541,
+      "sha256": "af2b891ba8086e653a041ca20a1c841873798003763097741e6db0c0ee89d19f"
+    },
+    "imaging_studies.csv": {
+      "bytes": 322873006,
+      "rows": 926399,
+      "sha256": "42511546499391e990c5374b0a85f378259a9e5238519933cc31d5b45813f0be"
+    },
+    "immunizations.csv": {
+      "bytes": 23294511,
+      "rows": 166311,
+      "sha256": "024b07f4b1d85182c30e67eaca1e86effae5816abf0cf8a0b0321b2012e3868c"
+    },
+    "medications.csv": {
+      "bytes": 153315625,
+      "rows": 585654,
+      "sha256": "0814e8ee74ae3ae28d71440db939b7a86817e1dbb4b20b9f5034d222dd9a8226"
+    },
+    "observations.csv": {
+      "bytes": 1567592857,
+      "rows": 8890232,
+      "sha256": "c1a4dd6ac3e45fb2146ff576bd3d8b62ea6825a684ddcf12968501aef838a255"
+    },
+    "organizations.csv": {
+      "bytes": 180270,
+      "rows": 1143,
+      "sha256": "941b208d1144c63df7ba312678cfb099c8bb43d7150801e3976516a04b00a80c"
+    },
+    "patients.csv": {
+      "bytes": 3467449,
+      "rows": 11564,
+      "sha256": "c7744e6a1abee8d470e4997a89c1a0765b7035826c4097e4bed8c11645690832"
+    },
+    "payer_transitions.csv": {
+      "bytes": 73084238,
+      "rows": 434225,
+      "sha256": "a56305cbaf336f2ce1bef111dd006b0475455361894b8932ef7d7ac3c337425b"
+    },
+    "payers.csv": {
+      "bytes": 1953,
+      "rows": 10,
+      "sha256": "76d6b439f5f9e121bd3defc8c714a1f4af25f5a65b12ad53bb0ffa7da91a5014"
+    },
+    "procedures.csv": {
+      "bytes": 302983496,
+      "rows": 1513133,
+      "sha256": "8d6626c740728ce4905c6da4897e5d7dd23a9dd08d0e2dd46a661240584324cf"
+    },
+    "providers.csv": {
+      "bytes": 215398,
+      "rows": 1143,
+      "sha256": "9075b25e0e3bb2d0bf6cc941003ab372bfbe77c4874b4653d7fb0c6e7165af9c"
+    },
+    "supplies.csv": {
+      "bytes": 16412229,
+      "rows": 112709,
+      "sha256": "e710dc9339231b0b254f090021cddf70ad62ef39952bc2645152d8873a7c066b"
+    }
+  }
+}
