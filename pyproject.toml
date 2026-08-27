@@ -14,6 +14,7 @@ dependencies = [
     "sqlalchemy>=2.0",
     "psycopg[binary]>=3.2",
     "pydantic>=2.9",
+    "lightgbm>=4.5",
 ]
 
 [dependency-groups]
@@ -47,3 +48,9 @@ select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
 strict = true
 files = ["src"]
 mypy_path = "src"
+
+# scikit-learn ships no py.typed marker, so its symbols resolve to Any.
+# Scoped to sklearn only; every other import stays strictly checked.
+[[tool.mypy.overrides]]
+module = "sklearn.*"
+ignore_missing_imports = true

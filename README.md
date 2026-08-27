@@ -42,6 +42,18 @@ Scoring targets adult inpatient discharges. The cohort module (`risk_scoring.coh
 
 The feature module (`risk_scoring.features`) computes one row per discharge, as of the discharge timestamp. The features are age, length of stay, inpatient and emergency visit counts over the prior 180 days, days since the previous discharge capped at 365, active medication and chronic condition counts, and seven comorbidity flags (heart failure, chronic pulmonary disease, dementia, diabetes, malignancy, myocardial infarction, chronic kidney disease) from curated code lists. No feature reads anything recorded after the scoring discharge, and the module docstring records each point-in-time rule. The same module serves both training and live scoring, and `FEATURE_VERSION` is logged with every prediction so scores are traceable to the feature definitions that produced them.
 
+## Labels and training
+
+The label module (`risk_scoring.labels`) marks a discharge as a readmission when the same patient starts another inpatient stay within 30 days of leaving, judged on the raw encounter stream. A stay that begins at or before the index discharge ends counts as a continuation of the same episode, not a readmission, and the module docstring records the boundary rules alongside its `LABEL_VERSION`.
+
+One command trains the model from a frozen population's CSV export and registers it:
+
+```bash
+python -m risk_scoring.train run --population baseline
+```
+
+Training uses only discharges that end before a fixed cutoff date (2025-01-01 by default), which reserves the most recent year of generated history for replay and guarantees every training label had time to mature. Evaluation runs on a patient-grouped holdout, so no patient appears on both sides of the split and the reported AUROC measures generalization to unseen patients. Each run logs the cohort, feature, and label versions, the cutoff, the split seed, holdout discrimination and prevalence metrics, and the model itself as a new version of `readmission-risk` in the MLflow registry. The pre-registered range the held-out AUROC is judged against, and what happens when a result lands outside it, are recorded in [docs/signal-band.md](docs/signal-band.md).
+
 ## Current Status
 
 Very early in development. The data spine exists (frozen synthetic populations plus verification tooling), the MLflow model registry is wired up, and the cohort and feature layers are implemented and tested, but the repository does not yet contain a runnable service. Setup and replay instructions will be added to this README once the infrastructure falls into place.
