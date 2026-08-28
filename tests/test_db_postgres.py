@@ -14,6 +14,14 @@ pytestmark = pytest.mark.db
 
 BOOTSTRAP_SQL = (db.MIGRATIONS_DIR / "0001_schema_migrations.sql").read_text()
 
+EXPECTED_TABLES = {
+    "schema_migrations",
+    "patients",
+    "encounters",
+    "medications",
+    "conditions",
+}
+
 
 def _public_tables(conn: psycopg.Connection[Any]) -> set[str]:
     rows = conn.execute("SELECT tablename FROM pg_tables WHERE schemaname = 'public'").fetchall()
@@ -23,7 +31,7 @@ def _public_tables(conn: psycopg.Connection[Any]) -> set[str]:
 def test_migrate_empty_database_creates_expected_tables(
     db_conn: psycopg.Connection[Any],
 ) -> None:
-    assert _public_tables(db_conn) == {"schema_migrations"}
+    assert _public_tables(db_conn) == EXPECTED_TABLES
 
     recorded = db.applied_migrations(db_conn)
     discovered = db.discover_migrations()
@@ -60,7 +68,7 @@ def test_migrate_failure_rolls_back_failed_migration_only(
             db.migrate(conn, migrations_dir=tmp_path)
 
         assert db.applied_migrations(conn) == {1: db.discover_migrations(tmp_path)[0].checksum}
-        assert _public_tables(conn) == {"schema_migrations"}
+        assert _public_tables(conn) == EXPECTED_TABLES
 
 
 def test_isolation_first_test_writes_scratch_table(
@@ -75,4 +83,4 @@ def test_isolation_second_test_sees_fresh_database(
     db_conn: psycopg.Connection[Any],
 ) -> None:
     """Runs after the scratch-table test; a shared database would still show it."""
-    assert _public_tables(db_conn) == {"schema_migrations"}
+    assert _public_tables(db_conn) == EXPECTED_TABLES
