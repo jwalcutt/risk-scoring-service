@@ -1,6 +1,6 @@
 # Service notes
 
-Recorded 2026-08-27, alongside the first infrastructure for the scoring service: a Compose-managed Postgres and the schema migration runner. The service itself does not exist yet. This note records the storage decisions made before any service code, and it will grow as the service does.
+Recorded 2026-08-27, alongside the first infrastructure for the scoring service: a Compose-managed Postgres, the schema migration runner, per-patient event state, the serving feature seam, and the HTTP service that loads a pinned model and validates incoming events. The endpoint does not yet write state or produce scores; those land when the ingestion path is wired to the state layer. This note records the storage decisions, the ingestion contract, the input hash definition, the version-pinning rules, and the registry-access decision, and it will grow as the service does.
 
 ## Why Postgres
 
@@ -79,3 +79,59 @@ Two things this run surfaced that are recorded rather than acted on:
 Medications and conditions are posted once, at their `START`, carrying the `STOP` they will eventually have. State therefore knows a prescription's end date before it arrives. No feature reads it early, because `STOP` is only ever compared against the discharge instant, so there is no leak today. A replay harness that instead posted a medication open and closed it later would collide with the key design, since a medication's key is its whole payload and the close would land as a second row rather than an update. Whether ingestion needs update semantics is a question for the replay harness, not for the data spine.
 
 Pandas emits one `UserWarning` per run about falling back from datetime format inference, raised by a single patient in the 500-patient sample whose medication start timestamps make the first-element format guess ambiguous. The fallback parses every value identically: explicit-format parsing was checked against inferred parsing for all eight timestamp columns of all three frozen populations and no value differs. The warning is a latent hazard rather than a present defect, and pinning explicit formats in the shared feature module is a change on its own, not part of this one.
+
+## Running the service
+
+```bash
+python -m risk_scoring.service run
+```
+
+The command reads `configs/service.toml` from the working directory, loads the pinned model version from the repo-local MLflow registry, and serves on port 8000 (`--port` overrides it). Startup fails with a nonzero exit if the pinned version is absent from the registry; the service never starts without its model.
+
+## Endpoints
+
+| Endpoint | Behavior |
+| --- | --- |
+| `GET /health` | `{"status": "ok"}`. A 200 implies startup completed, so the model is loaded. |
+| `GET /version` | Model name and pinned version from the config, `FEATURE_VERSION`, `COHORT_VERSION`, and the git SHA (null when unresolvable). |
+| `POST /events` | Validates one event and answers 202 with the event type and the input hash. |
+
+The git SHA comes from `git rev-parse HEAD` at startup and is null when the working directory is not a repository. The container image will not contain `.git`, so a build-time override must be added when the image exists.
+
+## The HTTP ingestion boundary
+
+Events arrive over one endpoint, in timestamp order, one at a time, wrapped in an envelope that names the type: `{"event_type": "encounter", "payload": {...}}`. The four accepted types and their payload columns are the four `risk_scoring.state` events, carrying the same Synthea column names and the same verbatim-string rule; the wire format restates none of those field rules and the request models exist to reject a malformed body before it reaches the state layer.
+
+A payload that fails validation gets FastAPI's 422 with field-level detail, which is the contract's reject-with-4xx: unknown event types, unknown fields, missing fields, and values that fail their exact format are all rejected loudly, and nothing is dropped silently. Accepted events answer 202 rather than 200, which stays honest both now, while the handler acknowledges without writing, and later, when an accepted event that is not a cohort discharge updates state without producing a score. The acknowledgment carries the input hash, giving batch drivers a provenance handle before the predictions log exists.
+
+The handler writes no state yet, and it keeps nothing in memory either: everything the service needs to score must be reconstructable from Postgres after a restart, so the only correct place for an accepted event is the state layer it will be wired to.
+
+## Input hash
+
+Every accepted event is hashed so a logged prediction can be tied to its exact input later. The definition, implemented as pure functions in `risk_scoring.payload_hash`:
+
+1. Parse the request body as JSON.
+2. Serialize the parsed object with keys sorted lexicographically at every nesting level, minimal separators (`","` and `":"`), `ensure_ascii=False`, and `allow_nan=False`.
+3. Encode as UTF-8 and take the SHA-256 digest, rendered as 64 lowercase hex characters.
+
+The handler hashes the body as received, before the request model parses it. Re-serializing the validated model was rejected because any coercion the model applied would contaminate the hash; with the raw-object route, "unmodified field values" is structural rather than something a test has to chase. The hash covers the whole envelope, including `event_type`, and is computed before any parsing into frames or feature work.
+
+Three consequences of the definition are worth stating. Formatting and key order of the wire text never change the digest, since the hash covers the parsed object; duplicate keys in the raw text collapse to the last occurrence. No unicode normalization is applied, so NFC and NFD spellings of one value hash differently, which is what unmodified values require. NaN and infinities raise a `ValueError` instead of producing unparseable output. A known-vector test pins the algorithm, so any change to the canonicalization breaks a test rather than silently rewriting history.
+
+## Model loading and version pinning
+
+The service loads its model once, at startup, from the MLflow registry that `risk_scoring.tracking.configure_tracking` points at, using `models:/readmission-risk/<version>` with the version read from `configs/service.toml`:
+
+```toml
+[model]
+name = "readmission-risk"
+version = 3
+```
+
+The pin must be an explicit positive integer. The loader rejects strings (including `"latest"` and numeric strings), booleans, zero, and negatives, and no code path in the service resolves "newest", so serving an unpinned model is structurally impossible. This deliberately differs from the gate, which defaults to the newest registered version when no pin is given: a gate wants the latest candidate, a service wants exactly what was promoted. A missing pin or an absent version stops startup with an error naming the model, the version, and the registry URI. The committed pin is version 3, the version the last full retrain from raw data produced, and a test asserts the committed name matches `risk_scoring.train.MODEL_NAME` so the two cannot drift.
+
+## How the container reaches the registry
+
+Decision: when the service gets its own Compose block, the container bind-mounts `mlflow.db` and `mlruns/` read-only. One registry stays the single source of truth for training, gating, and serving, and promotion remains an edit to one committed config value. The alternative, baking the model artifact into the image at build time, was rejected as the default because it forks the registry into per-image copies; it remains the recorded fallback if the mount proves brittle.
+
+Two known risks may trigger that fallback, and the restart tests against real containers will decide. First, `configure_tracking` pins each experiment's artifact location as an absolute `file://` URI of the training machine, and model loading resolves artifacts through the URI stored in the database, so the mount must reproduce the host's absolute path inside the container or the stored URIs must be regenerated. Second, SQLite on a read-only bind mount can fail on lock or journal acquisition depending on journal state; opening the database with `mode=ro&immutable=1`, or copying it in at startup, are the candidate mitigations. No Dockerfile exists yet: nothing in the service shell requires a container, and the service's Compose block waits until the ingestion path writes state, so the shared Compose file grows in one place at a time.
