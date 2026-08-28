@@ -41,9 +41,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "tests"))
 
 from factories import ordered_events  # noqa: E402
-from population_sample import load_population, sample_patients  # noqa: E402
+from population_sample import sample_patients  # noqa: E402
 from risk_scoring import db as db_module  # noqa: E402
 from risk_scoring import predictions  # noqa: E402
+from risk_scoring.populations import load_population  # noqa: E402
 
 EVENT_FIELDS: dict[str, tuple[str, ...]] = {
     "patient": ("Id", "BIRTHDATE", "DEATHDATE"),

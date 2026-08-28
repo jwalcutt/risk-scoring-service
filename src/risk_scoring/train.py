@@ -48,6 +48,7 @@ from sklearn.model_selection import GroupShuffleSplit
 from risk_scoring.cohort import COHORT_VERSION, build_cohort
 from risk_scoring.features import FEATURE_COLUMNS, FEATURE_VERSION, build_features
 from risk_scoring.labels import LABEL_VERSION, build_labels
+from risk_scoring.populations import load_population
 from risk_scoring.tracking import configure_tracking
 
 MODEL_NAME = "readmission-risk"
@@ -119,10 +120,9 @@ def train(
     """Train, evaluate, and register one fixture model from a CSV export."""
     cutoff = pd.Timestamp(TRAINING_CUTOFF, tz="UTC") if cutoff is None else cutoff
 
-    encounters = pd.read_csv(csv_dir / "encounters.csv", dtype=str, keep_default_na=False)
-    patients = pd.read_csv(csv_dir / "patients.csv", dtype=str, keep_default_na=False)
-    medications = pd.read_csv(csv_dir / "medications.csv", dtype=str, keep_default_na=False)
-    conditions = pd.read_csv(csv_dir / "conditions.csv", dtype=str, keep_default_na=False)
+    frames = load_population(csv_dir)
+    encounters, patients = frames["encounters"], frames["patients"]
+    medications, conditions = frames["medications"], frames["conditions"]
 
     cohort = filter_training_window(build_cohort(encounters, patients).frame, cutoff)
     labels = build_labels(cohort, encounters)

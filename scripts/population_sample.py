@@ -1,33 +1,16 @@
-"""Reading and sampling a frozen population, shared by the check scripts.
+"""Sampling a frozen population down to a runnable size.
 
 The frozen populations are local-only, verified by checksum manifest, so
 every check that runs against them is a script rather than a test. Both
-of those checks need the same two things: the CSVs read exactly as the
-training pipeline reads them, and a seeded patient sample that is worth
-running against.
+of those checks read their population with
+``risk_scoring.populations.load_population`` and then narrow it here.
 """
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
 import pandas as pd
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO_ROOT / "tests"))
-
-from risk_scoring.cohort import build_cohort  # noqa: E402
-
-POPULATION_FRAMES = ("patients", "encounters", "medications", "conditions")
-
-
-def load_population(csv_dir: Path) -> dict[str, pd.DataFrame]:
-    """Read a population's CSVs exactly as the training pipeline reads them."""
-    return {
-        name: pd.read_csv(csv_dir / f"{name}.csv", dtype=str, keep_default_na=False)
-        for name in POPULATION_FRAMES
-    }
+from risk_scoring.cohort import build_cohort
 
 
 def sample_patients(

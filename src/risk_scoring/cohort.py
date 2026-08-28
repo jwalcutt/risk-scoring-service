@@ -38,6 +38,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from risk_scoring.populations import load_population
+
 COHORT_VERSION = "1.0.0"
 
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
@@ -119,6 +121,5 @@ def build_cohort(encounters: pd.DataFrame, patients: pd.DataFrame) -> CohortResu
 
 def load_cohort(csv_dir: Path) -> CohortResult:
     """Build the cohort from a Synthea CSV export directory."""
-    encounters = pd.read_csv(csv_dir / "encounters.csv", dtype=str, keep_default_na=False)
-    patients = pd.read_csv(csv_dir / "patients.csv", dtype=str, keep_default_na=False)
-    return build_cohort(encounters, patients)
+    frames = load_population(csv_dir, frames=("encounters", "patients"))
+    return build_cohort(frames["encounters"], frames["patients"])

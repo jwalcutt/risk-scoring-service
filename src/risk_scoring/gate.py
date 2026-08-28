@@ -50,6 +50,7 @@ from risk_scoring.evaluation import (
 )
 from risk_scoring.features import FEATURE_COLUMNS, FEATURE_VERSION, build_features
 from risk_scoring.labels import LABEL_VERSION, build_labels
+from risk_scoring.populations import load_population
 from risk_scoring.tracking import configure_tracking
 from risk_scoring.train import MODEL_NAME, SIGNAL_BAND, filter_training_window, grouped_split
 
@@ -416,10 +417,9 @@ def run_gate(
     holdout_fraction = float(training_run.data.params["holdout_fraction"])
     expected_auroc = training_run.data.metrics["holdout_auroc"]
 
-    encounters = pd.read_csv(csv_dir / "encounters.csv", dtype=str, keep_default_na=False)
-    patients = pd.read_csv(csv_dir / "patients.csv", dtype=str, keep_default_na=False)
-    medications = pd.read_csv(csv_dir / "medications.csv", dtype=str, keep_default_na=False)
-    conditions = pd.read_csv(csv_dir / "conditions.csv", dtype=str, keep_default_na=False)
+    frames = load_population(csv_dir)
+    encounters, patients = frames["encounters"], frames["patients"]
+    medications, conditions = frames["medications"], frames["conditions"]
 
     cohort = filter_training_window(build_cohort(encounters, patients).frame, cutoff)
     labels = build_labels(cohort, encounters)
