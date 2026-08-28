@@ -15,7 +15,13 @@ import pandas as pd
 import pytest
 
 from factories import make_encounter_row, make_patient_row, write_rows_csv
-from risk_scoring.cohort import COHORT_VERSION, build_cohort, load_cohort
+from risk_scoring.cohort import (
+    COHORT_VERSION,
+    build_cohort,
+    filter_training_window,
+    load_cohort,
+    split_at_cutoff,
+)
 
 
 def frame(rows: list[dict[str, str]]) -> pd.DataFrame:
@@ -359,3 +365,88 @@ def test_empty_death_date_still_reads_as_missing() -> None:
     result = build_cohort(encounters, frame([make_patient_row(Id="p-adult", DEATHDATE="")]))
     assert list(result.frame["encounter_id"]) == ["e1"]
     assert result.exclusions.in_hospital_death == 0
+
+
+CUTOFF = pd.Timestamp("2025-01-01", tz="UTC")
+
+
+def cohort_at(stops: dict[str, str]) -> pd.DataFrame:
+    """A cohort frame of adult inpatient discharges at the given STOPs."""
+    encounters = frame(
+        [
+            make_encounter_row(
+                Id=encounter_id,
+                PATIENT="p-adult",
+                ENCOUNTERCLASS="inpatient",
+                START=stop,
+                STOP=stop,
+            )
+            for encounter_id, stop in stops.items()
+        ]
+    )
+    return build_cohort(encounters, frame([ADULT])).frame
+
+
+def test_a_discharge_at_the_cutoff_instant_is_held_out() -> None:
+    cohort = cohort_at(
+        {
+            "before": "2024-12-31T23:59:59Z",
+            "at": "2025-01-01T00:00:00Z",
+            "after": "2025-01-01T00:00:01Z",
+        }
+    )
+    split = split_at_cutoff(cohort, CUTOFF)
+    assert list(split.before["encounter_id"]) == ["before"]
+    assert list(split.at_or_after["encounter_id"]) == ["at", "after"]
+
+
+def test_the_two_halves_partition_the_cohort() -> None:
+    cohort = cohort_at(
+        {
+            "e1": "2023-05-05T00:00:00Z",
+            "e2": "2024-12-31T23:59:59Z",
+            "e3": "2025-01-01T00:00:00Z",
+            "e4": "2026-02-02T00:00:00Z",
+        }
+    )
+    split = split_at_cutoff(cohort, CUTOFF)
+    before = set(split.before["encounter_id"])
+    at_or_after = set(split.at_or_after["encounter_id"])
+    assert before.isdisjoint(at_or_after)
+    assert before | at_or_after == set(cohort["encounter_id"])
+    assert len(split.before) + len(split.at_or_after) == len(cohort)
+
+
+def test_the_training_half_is_what_the_training_window_keeps() -> None:
+    cohort = cohort_at(
+        {
+            "e1": "2023-05-05T00:00:00Z",
+            "e2": "2025-01-01T00:00:00Z",
+            "e3": "2026-02-02T00:00:00Z",
+        }
+    )
+    pd.testing.assert_frame_equal(
+        split_at_cutoff(cohort, CUTOFF).before, filter_training_window(cohort, CUTOFF)
+    )
+
+
+def test_both_halves_are_reindexed_from_zero() -> None:
+    cohort = cohort_at(
+        {
+            "e1": "2023-05-05T00:00:00Z",
+            "e2": "2025-06-06T00:00:00Z",
+            "e3": "2024-05-05T00:00:00Z",
+        }
+    )
+    split = split_at_cutoff(cohort, CUTOFF)
+    assert list(split.before.index) == [0, 1]
+    assert list(split.at_or_after.index) == [0]
+
+
+def test_splitting_an_empty_cohort_gives_two_empty_halves() -> None:
+    cohort = cohort_at({"e1": "2023-05-05T00:00:00Z"}).iloc[:0]
+    split = split_at_cutoff(cohort, CUTOFF)
+    assert split.before.empty
+    assert split.at_or_after.empty
+    assert list(split.before.columns) == list(cohort.columns)
+    assert list(split.at_or_after.columns) == list(cohort.columns)

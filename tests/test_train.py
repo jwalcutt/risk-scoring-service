@@ -26,7 +26,7 @@ from mlflow import MlflowClient
 
 from factories import write_training_csvs
 from risk_scoring import train
-from risk_scoring.cohort import build_cohort
+from risk_scoring.cohort import build_cohort, filter_training_window
 from risk_scoring.features import FEATURE_COLUMNS, build_features
 
 CUTOFF = pd.Timestamp("2025-01-01", tz="UTC")
@@ -48,13 +48,13 @@ def cohort_row(encounter_id: str, patient_id: str, stop: str) -> dict[str, objec
 
 def test_discharge_stopping_just_before_cutoff_is_kept() -> None:
     cohort = pd.DataFrame([cohort_row("e1", "p1", "2024-12-31T23:59:59Z")])
-    kept = train.filter_training_window(cohort, CUTOFF)
+    kept = filter_training_window(cohort, CUTOFF)
     assert list(kept["encounter_id"]) == ["e1"]
 
 
 def test_discharge_stopping_exactly_at_cutoff_is_excluded() -> None:
     cohort = pd.DataFrame([cohort_row("e1", "p1", "2025-01-01T00:00:00Z")])
-    assert train.filter_training_window(cohort, CUTOFF).empty
+    assert filter_training_window(cohort, CUTOFF).empty
 
 
 def test_discharge_stopping_after_cutoff_is_excluded() -> None:
@@ -64,7 +64,7 @@ def test_discharge_stopping_after_cutoff_is_excluded() -> None:
             cohort_row("e2", "p2", "2025-06-01T08:00:00Z"),
         ]
     )
-    kept = train.filter_training_window(cohort, CUTOFF)
+    kept = filter_training_window(cohort, CUTOFF)
     assert list(kept["encounter_id"]) == ["e1"]
 
 

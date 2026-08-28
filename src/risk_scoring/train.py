@@ -45,7 +45,7 @@ from mlflow import MlflowClient
 from sklearn.metrics import average_precision_score, roc_auc_score
 from sklearn.model_selection import GroupShuffleSplit
 
-from risk_scoring.cohort import COHORT_VERSION, build_cohort
+from risk_scoring.cohort import COHORT_VERSION, build_cohort, filter_training_window
 from risk_scoring.features import FEATURE_VERSION, MODEL_INPUT_COLUMNS, build_features
 from risk_scoring.labels import LABEL_VERSION, build_labels
 from risk_scoring.populations import load_population
@@ -92,12 +92,6 @@ class TrainingResult:
     n_holdout_patients: int
     holdout_prevalence: float
     in_band: bool
-
-
-def filter_training_window(cohort: pd.DataFrame, cutoff: pd.Timestamp) -> pd.DataFrame:
-    """Keep cohort rows whose discharge STOP is strictly before the cutoff."""
-    stop = cohort["stop"]
-    return cohort.loc[stop < cutoff].reset_index(drop=True)
 
 
 def grouped_split(

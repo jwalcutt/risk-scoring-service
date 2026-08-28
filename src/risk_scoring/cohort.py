@@ -63,6 +63,39 @@ class CohortResult:
     exclusions: ExclusionCounts
 
 
+@dataclass(frozen=True)
+class CohortSplit:
+    """A cohort cut in two at a timestamp, by discharge."""
+
+    before: pd.DataFrame
+    """Discharges strictly before the cutoff: what a model may train on."""
+
+    at_or_after: pd.DataFrame
+    """Discharges at or after the cutoff: what the model has never seen."""
+
+
+def split_at_cutoff(cohort: pd.DataFrame, cutoff: pd.Timestamp) -> CohortSplit:
+    """Partition cohort rows by whether the discharge precedes the cutoff.
+
+    Returning both halves from one call is what makes "held out" the exact
+    complement of "trained on". Stated as two independent filters in two
+    modules, a boundary that drifted on one side would leak discharges
+    into training and silently vanish from any held-out evaluation.
+
+    A discharge landing exactly on the cutoff instant is held out.
+    """
+    stop = cohort["stop"]
+    return CohortSplit(
+        before=cohort.loc[stop < cutoff].reset_index(drop=True),
+        at_or_after=cohort.loc[stop >= cutoff].reset_index(drop=True),
+    )
+
+
+def filter_training_window(cohort: pd.DataFrame, cutoff: pd.Timestamp) -> pd.DataFrame:
+    """Keep cohort rows whose discharge STOP is strictly before the cutoff."""
+    return split_at_cutoff(cohort, cutoff).before
+
+
 def _parse_death_dates(raw: pd.Series) -> pd.Series:
     cleaned = raw.fillna("").astype(str)
     return pd.to_datetime(cleaned.where(cleaned != "", None), format=DATE_FORMAT, utc=True)

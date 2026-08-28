@@ -37,7 +37,7 @@ import pandas as pd
 from mlflow import MlflowClient
 from sklearn.metrics import average_precision_score, brier_score_loss, roc_auc_score
 
-from risk_scoring.cohort import COHORT_VERSION, build_cohort
+from risk_scoring.cohort import COHORT_VERSION, build_cohort, filter_training_window
 from risk_scoring.evaluation import (
     BOOTSTRAP_REPLICATES,
     BOOTSTRAP_SEED,
@@ -52,7 +52,7 @@ from risk_scoring.features import FEATURE_VERSION, MODEL_INPUT_COLUMNS, build_fe
 from risk_scoring.labels import LABEL_VERSION, build_labels
 from risk_scoring.populations import load_population
 from risk_scoring.tracking import configure_tracking
-from risk_scoring.train import MODEL_NAME, SIGNAL_BAND, filter_training_window, grouped_split
+from risk_scoring.train import MODEL_NAME, SIGNAL_BAND, grouped_split
 
 ECE_THRESHOLD = 0.05
 
