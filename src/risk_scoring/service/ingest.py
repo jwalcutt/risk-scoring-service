@@ -35,10 +35,8 @@ import psycopg
 
 from risk_scoring import predictions, serving, state
 from risk_scoring.cohort import COHORT_VERSION
-from risk_scoring.features import FEATURE_COLUMNS, FEATURE_VERSION
+from risk_scoring.features import FEATURE_VERSION, MODEL_INPUT_COLUMNS
 from risk_scoring.service.config import ServiceConfig
-
-MODEL_INPUT_COLUMNS = FEATURE_COLUMNS[2:]
 
 
 @dataclass(frozen=True)

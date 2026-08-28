@@ -43,7 +43,12 @@ from factories import (
     make_encounter_row,
     make_medication_row,
 )
-from risk_scoring.features import FEATURE_COLUMNS, FEATURE_VERSION, build_features
+from risk_scoring.features import (
+    FEATURE_COLUMNS,
+    FEATURE_VERSION,
+    MODEL_INPUT_COLUMNS,
+    build_features,
+)
 
 SCORE_START = "2024-06-01T08:00:00Z"
 SCORE_STOP = "2024-06-05T08:00:00Z"
@@ -638,3 +643,10 @@ def test_empty_optional_timestamps_still_read_as_missing() -> None:
     )
     assert row["active_medication_count"] == 1
     assert row["active_disorder_count"] == 1
+
+
+def test_model_input_columns_drop_the_two_identifier_columns() -> None:
+    assert FEATURE_COLUMNS[2:] == MODEL_INPUT_COLUMNS
+    assert "encounter_id" not in MODEL_INPUT_COLUMNS
+    assert "patient_id" not in MODEL_INPUT_COLUMNS
+    assert len(MODEL_INPUT_COLUMNS) == len(FEATURE_COLUMNS) - 2

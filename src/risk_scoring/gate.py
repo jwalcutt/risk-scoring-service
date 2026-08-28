@@ -48,7 +48,7 @@ from risk_scoring.evaluation import (
     calibration_bins,
     expected_calibration_error,
 )
-from risk_scoring.features import FEATURE_COLUMNS, FEATURE_VERSION, build_features
+from risk_scoring.features import FEATURE_VERSION, MODEL_INPUT_COLUMNS, build_features
 from risk_scoring.labels import LABEL_VERSION, build_labels
 from risk_scoring.populations import load_population
 from risk_scoring.tracking import configure_tracking
@@ -424,7 +424,7 @@ def run_gate(
     cohort = filter_training_window(build_cohort(encounters, patients).frame, cutoff)
     labels = build_labels(cohort, encounters)
     features = build_features(cohort, encounters, medications, conditions)
-    x = features.loc[:, list(FEATURE_COLUMNS[2:])].astype("float64")
+    x = features.loc[:, list(MODEL_INPUT_COLUMNS)].astype("float64")
     y = labels["label"].to_numpy(dtype=float)
     _, holdout_idx = grouped_split(features["patient_id"], holdout_fraction, seed)
 

@@ -46,7 +46,7 @@ from sklearn.metrics import average_precision_score, roc_auc_score
 from sklearn.model_selection import GroupShuffleSplit
 
 from risk_scoring.cohort import COHORT_VERSION, build_cohort
-from risk_scoring.features import FEATURE_COLUMNS, FEATURE_VERSION, build_features
+from risk_scoring.features import FEATURE_VERSION, MODEL_INPUT_COLUMNS, build_features
 from risk_scoring.labels import LABEL_VERSION, build_labels
 from risk_scoring.populations import load_population
 from risk_scoring.tracking import configure_tracking
@@ -130,7 +130,7 @@ def train(
 
     # Float inputs keep the logged model signature all-double, so schema
     # enforcement at serving time tolerates missing values.
-    x = features.loc[:, list(FEATURE_COLUMNS[2:])].astype("float64")
+    x = features.loc[:, list(MODEL_INPUT_COLUMNS)].astype("float64")
     y = labels["label"]
     train_idx, holdout_idx = grouped_split(features["patient_id"], holdout_fraction, seed)
     x_train, y_train = x.iloc[train_idx], y.iloc[train_idx]

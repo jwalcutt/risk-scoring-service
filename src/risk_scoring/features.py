@@ -91,6 +91,12 @@ FEATURE_COLUMNS = (
     "flag_renal_disease",
 )
 
+# The two identifier columns are not features. Training, the gate, the
+# serving path, and provenance re-verification all need the model's actual
+# input column set, so it is named once here rather than re-sliced at each
+# call site where the slice could silently drift.
+MODEL_INPUT_COLUMNS = FEATURE_COLUMNS[2:]
+
 FLAG_CODES: dict[str, frozenset[str]] = {
     "flag_chf": frozenset({"88805009", "84114007"}),
     "flag_chronic_pulmonary": frozenset({"233678006", "87433001", "185086009", "195967001"}),
