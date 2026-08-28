@@ -133,20 +133,29 @@ def iso_timestamp(moment: datetime) -> str:
     return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def write_training_csvs(csv_dir: Path) -> int:
+def write_training_csvs(csv_dir: Path, *, n_patients: int = 100) -> int:
     """Synthetic population with a learnable signal; returns the cohort row count.
 
-    Forty adult patients each have one index inpatient stay well before the
-    cutoff. Even-numbered patients carry a prior emergency visit (the
-    signal) and an inpatient readmission 10 days after the index discharge;
-    the readmission stays are cohort rows themselves, so the pre-cutoff
-    cohort holds 60 rows. One extra patient discharges after the cutoff and
-    must be excluded. The signal is deterministic, so an honestly trained
-    model on this population scores near-perfect AUROC.
+    Each adult patient has one index inpatient stay well before the cutoff.
+    Even-numbered patients carry a prior emergency visit (the signal) and an
+    inpatient readmission 10 days after the index discharge; the readmission
+    stays are cohort rows themselves, so the pre-cutoff cohort holds one and
+    a half rows per patient. One extra patient discharges after the cutoff
+    and must be excluded. The signal is deterministic, so an honestly
+    trained model on this population separates perfectly and lands above the
+    signal band ceiling.
+
+    The default patient count is what makes that true rather than
+    aspirational. Training uses ``min_data_in_leaf`` 20, so a population
+    small enough to leave fewer than roughly a hundred training rows gives
+    LightGBM no split it will take, and the booster comes back constant at
+    the base rate: every feature vector scores the same number, AUROC is
+    exactly 0.5, and any test comparing scores holds no matter what the
+    scoring path does.
     """
     patients = []
     encounters = []
-    for i in range(40):
+    for i in range(n_patients):
         pid = f"p{i:02d}"
         patients.append(make_patient_row(Id=pid, BIRTHDATE="1960-01-01"))
         index_start = datetime(2024, 3, 1, 8, 0, tzinfo=UTC) + timedelta(days=i)
@@ -204,7 +213,7 @@ def write_training_csvs(csv_dir: Path) -> int:
         csv_dir / "conditions.csv",
         [make_condition_row(PATIENT="p00", ENCOUNTER="e-index-p00")],
     )
-    return 60
+    return n_patients + n_patients // 2
 
 
 def write_gate_population(csv_dir: Path, *, seed: int = 20260101, n_patients: int = 2000) -> None:

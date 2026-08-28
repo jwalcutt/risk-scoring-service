@@ -78,7 +78,11 @@ def test_cli_exits_nonzero_on_failing_gate_but_keeps_the_evidence(
         pipeline.main(["retrain", "--report", str(report_path)])
 
     assert excinfo.value.code == 1
-    assert "FAIL" in capsys.readouterr().out
+    # Asserting only that it failed would also pass if the model came back at
+    # chance and tripped the floor instead, which is the opposite diagnosis.
+    output = capsys.readouterr().out
+    assert "FAIL" in output
+    assert "SUSPECTED LEAKAGE" in output
     assert "FAIL" in report_path.read_text()
     version = MlflowClient().get_model_version(MODEL_NAME, "1")
     assert version.tags["gate_verdict"] == "fail"

@@ -114,11 +114,16 @@ def test_train_end_to_end_registers_model_with_versions_metrics_and_band_tag(
 
     assert result.n_train_rows + result.n_holdout_rows == expected_rows
     # The post-cutoff patient is excluded by the training window.
-    assert result.n_train_patients + result.n_holdout_patients == 40
-    assert 0.0 <= result.auroc <= 1.0
+    assert result.n_train_patients + result.n_holdout_patients == 100
+    # The signal is deterministic, so an honestly trained model separates the
+    # holdout perfectly. Asserting only that AUROC is a probability would pass
+    # against a booster that took no split at all and scored every row the
+    # same, which is what this population used to produce.
+    assert result.auroc == 1.0
     assert 0.0 <= result.pr_auc <= 1.0
     assert 0.0 < result.holdout_prevalence < 1.0
     assert result.in_band == (0.65 <= result.auroc <= 0.92)
+    assert not result.in_band
 
     client = MlflowClient()
     versions = client.search_model_versions(f"name = '{train.MODEL_NAME}'")

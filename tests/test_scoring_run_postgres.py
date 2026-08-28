@@ -13,13 +13,12 @@ from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
-import mlflow
 import pandas as pd
 import psycopg
 import pytest
 from fastapi.testclient import TestClient
 
-from factories import write_gate_population, write_skew_population
+from factories import write_skew_population
 from risk_scoring import predictions, scoring_run, train
 from risk_scoring.service.app import create_app
 from risk_scoring.service.config import ServiceConfig
@@ -59,27 +58,12 @@ def csv_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return directory
 
 
-@pytest.fixture(scope="module")
-def signal_repo(
-    tmp_path_factory: pytest.TempPathFactory,
-) -> Iterator[tuple[Path, train.TrainingResult]]:
-    """A registry whose model's score depends on its input, so checks can bite."""
-    old_tracking = mlflow.get_tracking_uri()
-    old_registry = mlflow.get_registry_uri()
-    root = tmp_path_factory.mktemp("batch-repo")
-    write_gate_population(root / "data" / "baseline" / "csv")
-    result = train.train(root / "data" / "baseline" / "csv", root)
-    yield root, result
-    mlflow.set_tracking_uri(old_tracking)
-    mlflow.set_registry_uri(old_registry)
-
-
 @pytest.fixture()
 def run(
-    csv_dir: Path, signal_repo: tuple[Path, train.TrainingResult], db_url: str
+    csv_dir: Path, trained_repo: tuple[Path, train.TrainingResult], db_url: str
 ) -> Iterator[Any]:
     """Run one batch against a fresh database, returning result and poster."""
-    root, trained = signal_repo
+    root, trained = trained_repo
     app = create_app(ServiceConfig(MODEL_NAME, trained.model_version), root, db_url)
 
     def go(**overrides: Any) -> tuple[scoring_run.BatchRunResult, ClientPoster]:

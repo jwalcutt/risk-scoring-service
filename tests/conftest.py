@@ -13,7 +13,7 @@ import psycopg
 import pytest
 from psycopg import sql
 
-from factories import write_training_csvs
+from factories import write_gate_population
 from risk_scoring import db as db_module
 from risk_scoring import train
 
@@ -102,17 +102,26 @@ def db_conn(db_url: str) -> Iterator[psycopg.Connection[Any]]:
 def trained_repo(
     tmp_path_factory: pytest.TempPathFactory,
 ) -> Iterator[tuple[Path, train.TrainingResult]]:
-    """One fast population trained and registered once per test module.
+    """A registered model whose score depends on its input, once per module.
 
     Module scope rather than session scope: the fixture points the global
     MLflow URIs at its own repo root for as long as it lives, so keeping
     that window to one module at a time avoids surprising any other test
     that reads the registry.
+
+    The population is the signal-bearing one, not the smaller deterministic
+    training population, and the reason is the whole point of this fixture.
+    Every test that compares logged scores, re-scores stored features, or
+    checks that two runs agree is only as strong as the spread of scores the
+    model produces. A model that returns one number for every input satisfies
+    all of those assertions without exercising anything. This population
+    lands mid-band and gives six distinct scores across the ten discharges
+    the service tests ingest; ``test_trained_fixture.py`` keeps it that way.
     """
     old_tracking = mlflow.get_tracking_uri()
     old_registry = mlflow.get_registry_uri()
     root = tmp_path_factory.mktemp("service-repo")
-    write_training_csvs(root / "data" / "baseline" / "csv")
+    write_gate_population(root / "data" / "baseline" / "csv")
     result = train.train(root / "data" / "baseline" / "csv", root)
     yield root, result
     mlflow.set_tracking_uri(old_tracking)

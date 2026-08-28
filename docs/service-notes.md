@@ -263,7 +263,11 @@ The model comes from the version the row itself names, never the version the ser
 
 Comparison is exact and carries no tolerance. The score column is `double precision` and the feature values are `jsonb`, so both round-trip losslessly, and two loads of one artifact deserialize the same booster. The mistakes worth catching here, a wrong column order or a rounded stored value or the wrong version, either move the score visibly or not at all, so a tolerance would only widen the band where something subtly wrong looks fine. A mismatch reports both values with their absolute and last-bit difference, so a run on different hardware would be diagnosable rather than merely failed.
 
-`tests/test_provenance_postgres.py` runs the same recomputation in CI over a synthetic population. It trains on the signal-bearing population rather than the small fixture the other service tests share. That fixture trains on 46 rows and produces a constant predictor, returning the base rate for every input, so the score half of every assertion would have held no matter what the re-score returned.
+`tests/test_provenance_postgres.py` runs the same recomputation in CI over a synthetic population.
+
+Writing that check surfaced a weakness in the fixture underneath it. The model every service test shared was trained on 46 rows against a `min_data_in_leaf` of 20, so LightGBM took no split at all and the booster returned the base rate for every feature vector it was ever given: one score across all ten discharges the service tests ingest, and a holdout AUROC of exactly 0.5. Nothing failed, because a constant model satisfies an equality between two runs exactly as well as a real one does, and the assertion that should have caught it checked only that AUROC was a probability. Two gate tests were affected in a subtler way, failing on the band floor while their comments explained they were exercising the ceiling.
+
+The fixture now trains on the signal-bearing population, which lands mid-band and produces six distinct scores across those ten discharges. `tests/test_trained_fixture.py` holds it there, asserting that the model is not constant, that it lands inside the pre-registered band, and that it spreads scores across the population the service tests actually post. The smaller deterministic population was enlarged until it delivers the perfect separation its docstring always claimed, and the two gate tests now assert the leakage banner rather than merely a failure.
 
 ## The held-out batch
 
