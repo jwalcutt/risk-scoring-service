@@ -10,11 +10,12 @@ patient is living and adult).
 from __future__ import annotations
 
 import csv
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
 PATIENT_DEFAULTS: dict[str, str] = {
     "Id": "patient-1",
@@ -357,4 +358,17 @@ def write_leak_population(csv_dir: Path, *, seed: int = 20260101, n_patients: in
     write_rows_csv(
         csv_dir / "conditions.csv",
         [make_condition_row(PATIENT="l0000", ENCOUNTER="e0-l0000")],
+    )
+
+
+def payload_frame(rows: Iterable[Mapping[str, str]], columns: Sequence[str]) -> pd.DataFrame:
+    """Project builder rows onto an ingestion payload column set.
+
+    The result is shaped exactly like ``state.patient_history`` read-back:
+    uppercase Synthea names in payload order, verbatim string values, empty
+    strings for missing. Passing no rows yields the empty frame with those
+    columns, which is what a patient with no medications reads back as.
+    """
+    return pd.DataFrame(
+        [{name: row[name] for name in columns} for row in rows], columns=list(columns)
     )
