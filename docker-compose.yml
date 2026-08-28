@@ -1,0 +1,20 @@
+services:
+  postgres:
+    # Digest recorded in docs/service-notes.md; bump tag and digest together.
+    image: postgres:17.6-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-risk}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-risk}
+      POSTGRES_DB: ${POSTGRES_DB:-risk_scoring}
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-risk} -d ${POSTGRES_DB:-risk_scoring}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  postgres-data:

@@ -20,3 +20,6 @@ mlflow.db
 
 # Synthea release jar (pinned by URL + checksum in configs/generation.toml)
 tools/synthea/
+
+# Local Compose overrides (credentials, ports)
+.env
