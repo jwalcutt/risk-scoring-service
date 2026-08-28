@@ -36,10 +36,10 @@ from typing import Any
 import psycopg
 from psycopg import sql
 
-from population_sample import sample_patients
 from risk_scoring import db as db_module
 from risk_scoring import predictions
 from risk_scoring.populations import load_population
+from risk_scoring.sampling import sample_patients
 from risk_scoring.stream import build_stream
 
 REPO_ROOT = Path(__file__).resolve().parent.parent

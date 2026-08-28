@@ -30,12 +30,12 @@ import pandas as pd
 import psycopg
 from psycopg import sql
 
-from population_sample import sample_patients
 from risk_scoring import db as db_module
 from risk_scoring import serving, state
 from risk_scoring.cohort import build_cohort
 from risk_scoring.features import FEATURE_COLUMNS, build_features
 from risk_scoring.populations import load_population
+from risk_scoring.sampling import sample_patients
 from risk_scoring.stream import ordered_events
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
