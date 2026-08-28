@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 import pandas as pd
@@ -56,6 +56,19 @@ def _check_exact_format(value: str, fmt: str, label: str) -> None:
         raise MalformedEventError(f"{label} must match {fmt!r}; got {value!r}") from exc
     if parsed.strftime(fmt) != value:
         raise MalformedEventError(f"{label} must match {fmt!r} exactly; got {value!r}")
+
+
+def parse_timestamp(value: str) -> datetime:
+    """Parse a stored event timestamp into an aware UTC datetime.
+
+    Event values stay verbatim strings everywhere state is concerned, but
+    the prediction log stores real timestamps, so the conversion lives
+    here, beside the format that guarantees it is lossless: every stored
+    value has already round-tripped through TIMESTAMP_FORMAT, whose
+    literal Z fixes the zone.
+    """
+    _check_exact_format(value, TIMESTAMP_FORMAT, "timestamp")
+    return datetime.strptime(value, TIMESTAMP_FORMAT).replace(tzinfo=UTC)
 
 
 def _check_optional_format(value: str, fmt: str, label: str) -> None:

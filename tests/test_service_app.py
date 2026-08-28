@@ -1,20 +1,23 @@
-"""Tests for the service app factory, startup model loading, and endpoints.
+"""Tests for the service app factory, startup, and endpoints.
 
 The rules these tests pin:
 
 - Startup loads the pinned model version from the MLflow registry and
-  fails loudly, at startup rather than as a later 500, when the pinned
-  version (or the whole registered model) is absent.
+  opens the connection pool, and fails loudly, at startup rather than as
+  a later 500, when either the pinned version or the database is absent.
 - /health answers ok only once the lifespan has run, so a 200 implies
-  the model actually loaded.
+  the model loaded and the database is reachable.
 - /version reports the full provenance set: model name and pinned
   version, FEATURE_VERSION, COHORT_VERSION, and the git SHA when one is
   resolvable.
 - POST /events acknowledges a valid event with 202 and the input hash of
   the raw posted object: the hash is computed from the body as received,
   so equivalent JSON texts with different key orders hash identically.
-- Malformed payloads are rejected with 422, never a 5xx and never a
-  silent drop; the stubbed ingestion has no side effects of any kind.
+- Bad shape and bad field format are both rejected with 422, never a
+  5xx and never a silent drop.
+
+What the accepted events actually do to state and to the prediction log
+is pinned separately, in test_service_ingest_postgres.
 """
 
 from __future__ import annotations
@@ -24,11 +27,10 @@ import subprocess
 from collections.abc import Iterator
 from pathlib import Path
 
-import mlflow
 import pytest
 from fastapi.testclient import TestClient
 
-from factories import make_encounter_row, write_training_csvs
+from factories import make_encounter_row, make_patient_row
 from risk_scoring import train
 from risk_scoring.cohort import COHORT_VERSION
 from risk_scoring.features import FEATURE_VERSION
@@ -37,40 +39,38 @@ from risk_scoring.service.app import create_app, resolve_git_sha
 from risk_scoring.service.config import ServiceConfig
 from risk_scoring.train import MODEL_NAME
 
+# The app opens its connection pool at startup and refuses to start without
+# a reachable database, so every test that builds one needs Postgres.
+pytestmark = pytest.mark.db
+
+ENCOUNTER_FIELDS = ("Id", "START", "STOP", "PATIENT", "ENCOUNTERCLASS")
+PATIENT_FIELDS = ("Id", "BIRTHDATE", "DEATHDATE")
+
 # --- fixtures ---
 
 
-@pytest.fixture(scope="module")
-def trained_repo(
-    tmp_path_factory: pytest.TempPathFactory,
-) -> Iterator[tuple[Path, train.TrainingResult]]:
-    """One fast population trained and registered once for this module."""
-    old_tracking = mlflow.get_tracking_uri()
-    old_registry = mlflow.get_registry_uri()
-    root = tmp_path_factory.mktemp("service-repo")
-    csv_dir = root / "data" / "baseline" / "csv"
-    write_training_csvs(csv_dir)
-    result = train.train(csv_dir, root)
-    yield root, result
-    mlflow.set_tracking_uri(old_tracking)
-    mlflow.set_registry_uri(old_registry)
-
-
 @pytest.fixture()
-def client(trained_repo: tuple[Path, train.TrainingResult]) -> Iterator[TestClient]:
+def client(trained_repo: tuple[Path, train.TrainingResult], db_url: str) -> Iterator[TestClient]:
     root, trained = trained_repo
-    app = create_app(ServiceConfig(MODEL_NAME, trained.model_version), root)
+    app = create_app(ServiceConfig(MODEL_NAME, trained.model_version), root, db_url)
     with TestClient(app) as test_client:
         yield test_client
 
 
+def _event(event_type: str, row: dict[str, str], fields: tuple[str, ...]) -> dict[str, object]:
+    return {"event_type": event_type, "payload": {field: row[field] for field in fields}}
+
+
+def _patient_event() -> dict[str, object]:
+    return _event("patient", make_patient_row(), PATIENT_FIELDS)
+
+
 def _encounter_event() -> dict[str, object]:
     row = make_encounter_row(ENCOUNTERCLASS="inpatient")
-    payload = {field: row[field] for field in ("Id", "START", "STOP", "PATIENT", "ENCOUNTERCLASS")}
-    return {"event_type": "encounter", "payload": payload}
+    return _event("encounter", row, ENCOUNTER_FIELDS)
 
 
-# --- startup and model loading ---
+# --- startup ---
 
 
 def test_startup_loads_pinned_model_and_health_is_ok(client: TestClient) -> None:
@@ -80,17 +80,28 @@ def test_startup_loads_pinned_model_and_health_is_ok(client: TestClient) -> None
 
 
 def test_startup_fails_loudly_when_pinned_version_absent(
-    trained_repo: tuple[Path, train.TrainingResult],
+    trained_repo: tuple[Path, train.TrainingResult], db_url: str
 ) -> None:
     root, _ = trained_repo
-    app = create_app(ServiceConfig(MODEL_NAME, 999), root)
+    app = create_app(ServiceConfig(MODEL_NAME, 999), root, db_url)
     with pytest.raises(RuntimeError, match=r"readmission-risk.*999"), TestClient(app):
         pass
 
 
-def test_startup_fails_loudly_when_registry_empty(repo_root: Path) -> None:
-    app = create_app(ServiceConfig(MODEL_NAME, 1), repo_root)
+def test_startup_fails_loudly_when_registry_empty(repo_root: Path, db_url: str) -> None:
+    app = create_app(ServiceConfig(MODEL_NAME, 1), repo_root, db_url)
     with pytest.raises(RuntimeError, match="version 1"), TestClient(app):
+        pass
+
+
+def test_startup_fails_loudly_when_database_unreachable(
+    trained_repo: tuple[Path, train.TrainingResult],
+) -> None:
+    """A 200 from /health has to mean the service can actually store an event."""
+    root, trained = trained_repo
+    unreachable = "postgresql://risk:risk@127.0.0.1:1/risk_scoring"
+    app = create_app(ServiceConfig(MODEL_NAME, trained.model_version), root, unreachable)
+    with pytest.raises(RuntimeError, match="database"), TestClient(app):
         pass
 
 
@@ -131,8 +142,11 @@ def test_resolve_git_sha_in_repo_and_outside(tmp_path: Path) -> None:
 
 
 def test_post_event_returns_202_with_input_hash(client: TestClient) -> None:
+    client.post("/events", json=_patient_event())
     event = _encounter_event()
+
     response = client.post("/events", json=event)
+
     assert response.status_code == 202
     body = response.json()
     assert body["status"] == "accepted"
@@ -142,6 +156,7 @@ def test_post_event_returns_202_with_input_hash(client: TestClient) -> None:
 
 def test_post_all_four_event_types_accepted(client: TestClient) -> None:
     events: list[dict[str, object]] = [
+        _patient_event(),
         _encounter_event(),
         {
             "event_type": "medication",
@@ -165,10 +180,6 @@ def test_post_all_four_event_types_accepted(client: TestClient) -> None:
                 "DESCRIPTION": "Viral sinusitis (disorder)",
             },
         },
-        {
-            "event_type": "patient",
-            "payload": {"Id": "patient-1", "BIRTHDATE": "1970-01-01", "DEATHDATE": ""},
-        },
     ]
     for event in events:
         response = client.post("/events", json=event)
@@ -177,11 +188,11 @@ def test_post_all_four_event_types_accepted(client: TestClient) -> None:
 
 
 def test_hash_covers_raw_body_not_model(client: TestClient) -> None:
-    event = _encounter_event()
+    event = _patient_event()
     payload = dict(event["payload"])  # type: ignore[arg-type]
     ordered = json.dumps(event)
     reordered = json.dumps(
-        {"payload": dict(reversed(list(payload.items()))), "event_type": "encounter"}
+        {"payload": dict(reversed(list(payload.items()))), "event_type": "patient"}
     )
     headers = {"content-type": "application/json"}
     first = client.post("/events", content=ordered, headers=headers)
@@ -190,7 +201,7 @@ def test_hash_covers_raw_body_not_model(client: TestClient) -> None:
     assert first.json()["input_hash"] == second.json()["input_hash"]
 
     altered = json.loads(ordered)
-    altered["payload"]["Id"] = "encounter-2"
+    altered["payload"]["Id"] = "patient-2"
     third = client.post("/events", json=altered)
     assert third.json()["input_hash"] != first.json()["input_hash"]
 
@@ -202,11 +213,15 @@ def test_malformed_payloads_rejected_4xx(client: TestClient) -> None:
     missing = {field: value for field, value in payload.items() if field != "PATIENT"}
     unknown_type = {"event_type": "observation", "payload": payload}
     extra_field = {"event_type": "encounter", "payload": {**payload, "PAYER": "payer-1"}}
+    bad_format = {"event_type": "encounter", "payload": {**payload, "START": "2024-01-01"}}
+    empty_identity = {"event_type": "encounter", "payload": {**payload, "PATIENT": ""}}
 
     for bad in (
         {"event_type": "encounter", "payload": missing},
         unknown_type,
         extra_field,
+        bad_format,
+        empty_identity,
     ):
         response = client.post("/events", json=bad)
         assert response.status_code == 422, response.text
@@ -215,11 +230,3 @@ def test_malformed_payloads_rejected_4xx(client: TestClient) -> None:
         "/events", content="{not json", headers={"content-type": "application/json"}
     )
     assert invalid_json.status_code == 422
-
-
-def test_stubbed_ingestion_has_no_side_effects(client: TestClient) -> None:
-    event = _encounter_event()
-    first = client.post("/events", json=event)
-    second = client.post("/events", json=event)
-    assert first.status_code == second.status_code == 202
-    assert first.json() == second.json()

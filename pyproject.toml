@@ -13,6 +13,7 @@ dependencies = [
     "mlflow>=2.16",
     "sqlalchemy>=2.0",
     "psycopg[binary]>=3.2",
+    "psycopg-pool>=3.2",
     "pydantic>=2.9",
     "lightgbm>=4.5",
 ]

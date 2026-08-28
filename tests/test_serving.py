@@ -152,11 +152,18 @@ def test_encounter_absent_from_state_raises() -> None:
 
 
 def test_inpatient_discharge_without_demographics_raises() -> None:
-    """A missing patient row is joined-data corruption, not an exclusion."""
+    """Demographics arriving after the discharge is an ordering violation, not an exclusion."""
     history = _history(encounters=[make_encounter_row(ENCOUNTERCLASS="inpatient")])
 
-    with pytest.raises(ValueError, match="unknown patients"):
+    with pytest.raises(serving.UnknownPatientError, match="patient-1"):
         serving.serving_features(history, "encounter-1")
+
+
+def test_open_encounter_without_demographics_is_not_a_scoring_event() -> None:
+    """A stay still open is not scored, so its missing demographics are not yet a problem."""
+    history = _history(encounters=[make_encounter_row(ENCOUNTERCLASS="inpatient", STOP="")])
+
+    assert serving.serving_features(history, "encounter-1") is None
 
 
 def test_features_ignore_events_recorded_after_the_scored_discharge() -> None:

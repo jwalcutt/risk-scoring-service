@@ -26,6 +26,13 @@ Judgment calls this module fixes:
   an exclusion, and raises rather than returning nothing. A silent
   ``None`` there would make a lost ingestion look like a routine cohort
   exclusion.
+- A discharge whose patient has no demographics in state raises too. The
+  cohort module already refuses to admit an encounter with an unknown
+  patient; raising a named error here turns that into something the
+  caller can answer for, rather than a bare ValueError from a shared
+  module. It means the event stream delivered a discharge before the
+  demographics it depends on, which is an ordering violation worth
+  reporting, never a reason to skip the score.
 """
 
 from __future__ import annotations
@@ -43,6 +50,10 @@ class UnknownEncounterError(LookupError):
     """The encounter to score has no row in the patient's recorded history."""
 
 
+class UnknownPatientError(LookupError):
+    """The encounter to score belongs to a patient with no recorded demographics."""
+
+
 @dataclass(frozen=True)
 class ScoringInput:
     """One admitted discharge: its single-row cohort frame and feature frame."""
@@ -56,7 +67,8 @@ def serving_features(history: PatientHistory, encounter_id: str) -> ScoringInput
 
     Returns ``None`` when the encounter is not a scoring event: still open,
     or excluded by the cohort rules. Raises :class:`UnknownEncounterError`
-    if the encounter is not in ``history``.
+    if the encounter is not in ``history``, and :class:`UnknownPatientError`
+    if the patient's demographics have not been recorded.
     """
     encounters = history.encounters
     scored = encounters.loc[encounters["Id"] == encounter_id]
@@ -64,6 +76,12 @@ def serving_features(history: PatientHistory, encounter_id: str) -> ScoringInput
         raise UnknownEncounterError(f"encounter {encounter_id!r} is not in the patient's history")
     if scored["STOP"].iloc[0] == "":
         return None
+    if history.patients.empty:
+        patient = scored["PATIENT"].iloc[0]
+        raise UnknownPatientError(
+            f"encounter {encounter_id!r} belongs to patient {patient!r}, whose "
+            "demographics have not been recorded; the cohort rules need a birthdate"
+        )
 
     cohort = build_cohort(scored, history.patients).frame
     if cohort.empty:
