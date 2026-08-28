@@ -78,3 +78,30 @@ def test_run_without_config_file_fails_loudly(
     monkeypatch.chdir(tmp_path)
     with pytest.raises(FileNotFoundError):
         service_main.main(["run"], runner=lambda app, **kwargs: None)
+
+
+def test_run_defaults_to_binding_the_loopback_interface(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A host process stays local; only the container asks for 0.0.0.0."""
+    _write_config(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(service_main, "create_app", lambda config, repo_root: FastAPI())
+
+    served: dict[str, Any] = {}
+    service_main.main(["run"], runner=lambda app, **kwargs: served.update(kwargs))
+
+    assert served["host"] == "127.0.0.1"
+
+
+def test_run_binds_the_requested_host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write_config(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(service_main, "create_app", lambda config, repo_root: FastAPI())
+
+    served: dict[str, Any] = {}
+    service_main.main(
+        ["run", "--host", "0.0.0.0"], runner=lambda app, **kwargs: served.update(kwargs)
+    )
+
+    assert served["host"] == "0.0.0.0"

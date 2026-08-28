@@ -230,3 +230,26 @@ def test_malformed_payloads_rejected_4xx(client: TestClient) -> None:
         "/events", content="{not json", headers={"content-type": "application/json"}
     )
     assert invalid_json.status_code == 422
+
+
+def test_resolve_git_sha_prefers_the_environment_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The image carries no .git, so the build stamps the SHA in instead."""
+    stamped = "b" * 40
+    monkeypatch.setenv("RISK_SCORING_GIT_SHA", stamped)
+
+    bare = tmp_path / "not-a-repo"
+    bare.mkdir()
+    assert resolve_git_sha(bare) == stamped
+
+
+def test_an_empty_git_sha_override_falls_back_to_the_working_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unset build argument arrives as an empty string, which is not a SHA."""
+    monkeypatch.setenv("RISK_SCORING_GIT_SHA", "")
+
+    bare = tmp_path / "not-a-repo"
+    bare.mkdir()
+    assert resolve_git_sha(bare) is None

@@ -1,3 +1,9 @@
+# The whole stack: a database, a one-shot schema migration, and the service.
+#
+# Start it from the repository root. Compose interpolates ${PWD} into the
+# registry mounts and the service's working directory, so the absolute
+# file:// artifact URIs recorded in mlflow.db resolve to the same paths
+# inside the container as on the host, and any clone works unedited.
 services:
   postgres:
     # Digest recorded in docs/service-notes.md; bump tag and digest together.
@@ -15,6 +21,53 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+
+  # Schema changes are a separate one-shot service, so the running service
+  # never issues DDL and restarting it is a pure restart.
+  migrate:
+    build: &service-image
+      context: .
+      args:
+        GIT_SHA: ${GIT_SHA:-}
+    image: risk-scoring-service:dev
+    command: ["python", "-m", "risk_scoring.db", "migrate"]
+    environment:
+      RISK_SCORING_DATABASE_URL: &service-dsn
+        postgresql://${POSTGRES_USER:-risk}:${POSTGRES_PASSWORD:-risk}@postgres:5432/${SERVICE_DB:-risk_scoring}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  app:
+    build: *service-image
+    image: risk-scoring-service:dev
+    working_dir: ${PWD}
+    environment:
+      RISK_SCORING_DATABASE_URL: *service-dsn
+    volumes:
+      # The registry stays one store on the host. The database is read-only;
+      # mlruns is not, because loading a models:/ URI rewrites a derived
+      # metadata file beside the artifact. See docs/service-notes.md.
+      - ${PWD}/mlflow.db:${PWD}/mlflow.db:ro
+      - ${PWD}/mlruns:${PWD}/mlruns
+      - ${PWD}/configs:${PWD}/configs:ro
+    ports:
+      # Host port 8001, not 8000, so an app already listening on the usual
+      # port never collides with the stack. Same reasoning as Postgres 5433.
+      - "${SERVICE_PORT:-8001}:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen("http://127.0.0.1:8000/health")
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
 volumes:
   postgres-data:

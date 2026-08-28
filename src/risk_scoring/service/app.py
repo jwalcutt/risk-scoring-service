@@ -27,6 +27,7 @@ Judgment calls this module fixes:
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -52,10 +53,20 @@ from risk_scoring.state import EventConflictError, MalformedEventError
 from risk_scoring.tracking import configure_tracking, tracking_uri
 
 POOL_STARTUP_TIMEOUT_SECONDS = 10.0
+ENV_GIT_SHA = "RISK_SCORING_GIT_SHA"
 
 
 def resolve_git_sha(repo_root: Path) -> str | None:
-    """HEAD commit SHA of the repo at ``repo_root``, or None if unresolvable."""
+    """HEAD commit SHA: the build's stamp if it has one, else the working tree.
+
+    The image carries no ``.git``, so the build stamps the SHA into
+    ``RISK_SCORING_GIT_SHA`` and ``/version`` stays honest in a container.
+    An unset build argument arrives as an empty string, which is not a SHA,
+    so it falls through to the working tree the same as no variable at all.
+    """
+    stamped = os.environ.get(ENV_GIT_SHA, "").strip()
+    if stamped:
+        return stamped
     try:
         proc = subprocess.run(
             ["git", "rev-parse", "HEAD"],

@@ -1,0 +1,30 @@
+# Private planning documents. The privacy boundary applies to image layers
+# exactly as it applies to commits, so these come first.
+PLAN.md
+STEPS.md
+CLAUDE.md
+
+# The registry and the generated populations arrive by read-only mount, not
+# by copy: one registry stays the single source of truth, and the data is
+# gigabytes that no image needs.
+data/
+data_manifests/
+mlruns/
+mlflow.db
+tools/
+
+# Build inputs that would only invalidate layers or bloat the image.
+.git/
+.github/
+.claude/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.env
+docs/
+tests/
+scripts/
+synthea_modules/
