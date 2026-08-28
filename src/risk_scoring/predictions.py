@@ -27,6 +27,7 @@ Judgment calls this module fixes:
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -125,5 +126,21 @@ def prediction_for_encounter(
     ).fetchone()
     if row is None:
         return None
-    values = dict(zip(_READ_COLUMNS, row, strict=True))
-    return StoredPrediction(**values)
+    return _stored(row)
+
+
+def all_predictions(conn: psycopg.Connection[Any]) -> list[StoredPrediction]:
+    """The whole log, oldest write first; read-only.
+
+    Ordering by ``prediction_id`` is ordering by write, since the sequence
+    only ever advances. Callers that compare two runs of the same stream
+    read the log this way and compare position by position.
+    """
+    rows = conn.execute(
+        f"SELECT {', '.join(_READ_COLUMNS)} FROM predictions ORDER BY prediction_id"
+    ).fetchall()
+    return [_stored(row) for row in rows]
+
+
+def _stored(row: Sequence[Any]) -> StoredPrediction:
+    return StoredPrediction(**dict(zip(_READ_COLUMNS, row, strict=True)))

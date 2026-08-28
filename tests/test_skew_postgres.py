@@ -10,7 +10,6 @@ between training and serving is still a skew bug.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -18,55 +17,12 @@ import pandas as pd
 import psycopg
 import pytest
 
-from factories import write_skew_population
+from factories import ordered_events, write_skew_population
 from risk_scoring import serving, state
 from risk_scoring.cohort import build_cohort
 from risk_scoring.features import FEATURE_COLUMNS, build_features
 
 pytestmark = pytest.mark.db
-
-# Medications and conditions starting at the same instant a stay ends were
-# in effect during it, so they are ingested before that discharge event.
-_KIND_ORDER = {"medication": 0, "condition": 1, "encounter": 2}
-
-
-@dataclass(frozen=True)
-class _Event:
-    """One ingestion event and the simulated instant it arrives at."""
-
-    at: str
-    kind: str
-    row: dict[str, str]
-
-    @property
-    def sort_key(self) -> tuple[str, int, str]:
-        return (self.at, _KIND_ORDER[self.kind], repr(sorted(self.row.items())))
-
-
-def _ordered_events(
-    encounters: pd.DataFrame, medications: pd.DataFrame, conditions: pd.DataFrame
-) -> list[_Event]:
-    """Interleave every row into one timestamp-ordered stream.
-
-    An encounter is a discharge notification, so it arrives at its STOP.
-    Medications and conditions arrive at their START. Condition dates are
-    date-only, so a condition arrives at midnight of its start date, which
-    is what makes a condition recorded on a discharge date reach the
-    service before that day's discharge, matching how the feature module
-    judges condition activity against the discharge date.
-    """
-    events = [
-        _Event(at=row["STOP"], kind="encounter", row=dict(row)) for _, row in encounters.iterrows()
-    ]
-    events += [
-        _Event(at=row["START"], kind="medication", row=dict(row))
-        for _, row in medications.iterrows()
-    ]
-    events += [
-        _Event(at=f"{row['START']}T00:00:00Z", kind="condition", row=dict(row))
-        for _, row in conditions.iterrows()
-    ]
-    return sorted(events, key=lambda event: event.sort_key)
 
 
 def _replay(conn: psycopg.Connection[Any], frames: dict[str, pd.DataFrame]) -> pd.DataFrame:
@@ -75,7 +31,7 @@ def _replay(conn: psycopg.Connection[Any], frames: dict[str, pd.DataFrame]) -> p
         state.record_patient(conn, state.PatientEvent.from_row(dict(row)))
 
     scored: list[pd.DataFrame] = []
-    for event in _ordered_events(frames["encounters"], frames["medications"], frames["conditions"]):
+    for event in ordered_events(frames["encounters"], frames["medications"], frames["conditions"]):
         if event.kind == "medication":
             state.record_medication(conn, state.MedicationEvent.from_row(event.row))
             continue

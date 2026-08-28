@@ -159,3 +159,41 @@ def test_recorded_prediction_survives_a_rollback_on_the_same_connection(
     db_conn.rollback()
 
     assert predictions.has_prediction(db_conn, "encounter-1") is True
+
+
+def test_all_predictions_is_empty_before_anything_is_scored(
+    db_conn: psycopg.Connection[Any],
+) -> None:
+    assert predictions.all_predictions(db_conn) == []
+
+
+def test_all_predictions_returns_every_row_in_write_order(
+    db_conn: psycopg.Connection[Any],
+) -> None:
+    """Monitoring and the restart comparison both read the log in order."""
+    for encounter in ("encounter-c", "encounter-a", "encounter-b"):
+        predictions.record_prediction(db_conn, _record(encounter_id=encounter))
+
+    stored = predictions.all_predictions(db_conn)
+
+    assert [row.encounter_id for row in stored] == ["encounter-c", "encounter-a", "encounter-b"]
+    assert [row.prediction_id for row in stored] == sorted(row.prediction_id for row in stored)
+
+
+def test_all_predictions_round_trips_every_field(db_conn: psycopg.Connection[Any]) -> None:
+    predictions.record_prediction(db_conn, _record())
+
+    (stored,) = predictions.all_predictions(db_conn)
+
+    assert stored == predictions.prediction_for_encounter(db_conn, "encounter-1")
+
+
+def test_a_dropped_re_post_still_consumes_a_prediction_id(
+    db_conn: psycopg.Connection[Any],
+) -> None:
+    """So ids gap after a resume, and two runs of one stream cannot be compared by id."""
+    predictions.record_prediction(db_conn, _record(encounter_id="encounter-1"))
+    predictions.record_prediction(db_conn, _record(encounter_id="encounter-1"))
+    predictions.record_prediction(db_conn, _record(encounter_id="encounter-2"))
+
+    assert [row.prediction_id for row in predictions.all_predictions(db_conn)] == [1, 3]

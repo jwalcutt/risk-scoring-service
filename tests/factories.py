@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import csv
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -359,6 +360,58 @@ def write_leak_population(csv_dir: Path, *, seed: int = 20260101, n_patients: in
         csv_dir / "conditions.csv",
         [make_condition_row(PATIENT="l0000", ENCOUNTER="e0-l0000")],
     )
+
+
+# Medications and conditions starting at the instant a stay ends were in
+# effect during it, so they reach the service before that discharge.
+_KIND_ORDER = {"medication": 0, "condition": 1, "encounter": 2}
+
+
+@dataclass(frozen=True)
+class StreamEvent:
+    """One ingestion event and the simulated instant it arrives at."""
+
+    at: str
+    kind: str
+    row: dict[str, str]
+
+    @property
+    def sort_key(self) -> tuple[str, int, str]:
+        """Total order over the stream, with no tie left to input order."""
+        return (self.at, _KIND_ORDER[self.kind], repr(sorted(self.row.items())))
+
+
+def ordered_events(
+    encounters: pd.DataFrame, medications: pd.DataFrame, conditions: pd.DataFrame
+) -> list[StreamEvent]:
+    """Interleave every row of a population into one timestamp-ordered stream.
+
+    Arrival times follow each event's own meaning. An encounter is a
+    discharge notification, so it arrives at its STOP. Medications arrive
+    at their START. Condition dates are date-only, so a condition arrives
+    at midnight of its start date, which is what puts a condition recorded
+    on a discharge date in front of that day's discharge, matching how the
+    feature module judges condition activity against the discharge date
+    rather than the discharge instant.
+
+    The tie-break is the whole row, so the order is total and independent
+    of the order the frames happen to hold. Final state is arrival-order
+    independent by design, but a deterministic stream keeps the prediction
+    log comparable run to run.
+    """
+    events = [
+        StreamEvent(at=row["STOP"], kind="encounter", row=dict(row))
+        for _, row in encounters.iterrows()
+    ]
+    events += [
+        StreamEvent(at=row["START"], kind="medication", row=dict(row))
+        for _, row in medications.iterrows()
+    ]
+    events += [
+        StreamEvent(at=f"{row['START']}T00:00:00Z", kind="condition", row=dict(row))
+        for _, row in conditions.iterrows()
+    ]
+    return sorted(events, key=lambda event: event.sort_key)
 
 
 def payload_frame(rows: Iterable[Mapping[str, str]], columns: Sequence[str]) -> pd.DataFrame:

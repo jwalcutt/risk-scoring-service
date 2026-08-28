@@ -33,12 +33,11 @@ from psycopg import sql
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "tests"))
 
+from factories import ordered_events  # noqa: E402
 from risk_scoring import db as db_module  # noqa: E402
 from risk_scoring import serving, state  # noqa: E402
 from risk_scoring.cohort import build_cohort  # noqa: E402
 from risk_scoring.features import FEATURE_COLUMNS, build_features  # noqa: E402
-
-_KIND_ORDER = {"medication": 0, "condition": 1, "encounter": 2}
 
 
 def load_population(csv_dir: Path) -> dict[str, pd.DataFrame]:
@@ -70,47 +69,23 @@ def sample_patients(
     }
 
 
-def ordered_events(frames: dict[str, pd.DataFrame]) -> list[tuple[str, dict[str, str]]]:
-    """Interleave the rows into one timestamp-ordered event stream.
-
-    Encounters arrive at their STOP (a discharge notification), medications
-    at their START, and conditions at midnight of their date-only START.
-    At an equal instant, medications and conditions precede the discharge
-    they were in effect for.
-    """
-    events: list[tuple[tuple[str, int, str], str, dict[str, str]]] = []
-    for _, row in frames["encounters"].iterrows():
-        events.append(((row["STOP"], _KIND_ORDER["encounter"], row["Id"]), "encounter", dict(row)))
-    for _, row in frames["medications"].iterrows():
-        key = (row["START"], _KIND_ORDER["medication"], f"{row['ENCOUNTER']}|{row['CODE']}")
-        events.append((key, "medication", dict(row)))
-    for _, row in frames["conditions"].iterrows():
-        key = (
-            f"{row['START']}T00:00:00Z",
-            _KIND_ORDER["condition"],
-            f"{row['ENCOUNTER']}|{row['CODE']}",
-        )
-        events.append((key, "condition", dict(row)))
-    events.sort(key=lambda item: item[0])
-    return [(kind, row) for _, kind, row in events]
-
-
 def replay(conn: psycopg.Connection[Any], frames: dict[str, pd.DataFrame]) -> pd.DataFrame:
     """Ingest the stream, scoring each discharge the cohort rules admit."""
     for _, demographics in frames["patients"].iterrows():
         state.record_patient(conn, state.PatientEvent.from_row(dict(demographics)))
 
     scored: list[pd.DataFrame] = []
-    for kind, event in ordered_events(frames):
-        if kind == "medication":
-            state.record_medication(conn, state.MedicationEvent.from_row(event))
+    stream = ordered_events(frames["encounters"], frames["medications"], frames["conditions"])
+    for event in stream:
+        if event.kind == "medication":
+            state.record_medication(conn, state.MedicationEvent.from_row(event.row))
             continue
-        if kind == "condition":
-            state.record_condition(conn, state.ConditionEvent.from_row(event))
+        if event.kind == "condition":
+            state.record_condition(conn, state.ConditionEvent.from_row(event.row))
             continue
-        state.record_encounter(conn, state.EncounterEvent.from_row(event))
+        state.record_encounter(conn, state.EncounterEvent.from_row(event.row))
         result = serving.serving_features(
-            state.patient_history(conn, event["PATIENT"]), event["Id"]
+            state.patient_history(conn, event.row["PATIENT"]), event.row["Id"]
         )
         if result is not None:
             scored.append(result.features)

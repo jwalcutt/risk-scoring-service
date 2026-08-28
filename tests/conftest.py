@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -49,23 +49,43 @@ def _db_admin_url() -> str:
 
 
 @pytest.fixture()
-def db_url(_db_admin_url: str) -> Iterator[str]:
+def db_url_factory(_db_admin_url: str) -> Iterator[Callable[[], str]]:
+    """Make throwaway databases on demand, all dropped when the test ends.
+
+    Comparing two runs of one event stream needs two databases at once, so
+    the lifecycle lives here as a callable rather than in a fixture that
+    can only ever hand out one.
+    """
+    created: list[str] = []
+
+    def make() -> str:
+        database = f"test_risk_{uuid.uuid4().hex[:12]}"
+        with psycopg.connect(_db_admin_url, connect_timeout=2, autocommit=True) as admin:
+            admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database)))
+        created.append(database)
+        url = psycopg.conninfo.make_conninfo(_db_admin_url, dbname=database)
+        with psycopg.connect(url, connect_timeout=2) as conn:
+            db_module.migrate(conn)
+        return url
+
+    try:
+        yield make
+    finally:
+        with psycopg.connect(_db_admin_url, connect_timeout=2, autocommit=True) as admin:
+            for database in created:
+                admin.execute(
+                    sql.SQL("DROP DATABASE {} WITH (FORCE)").format(sql.Identifier(database))
+                )
+
+
+@pytest.fixture()
+def db_url(db_url_factory: Callable[[], str]) -> str:
     """A freshly created, fully migrated throwaway database, as a DSN.
 
     Tests that drive the service through HTTP need the DSN rather than a
     connection, because the app opens its own pool.
     """
-    database = f"test_risk_{uuid.uuid4().hex[:12]}"
-    with psycopg.connect(_db_admin_url, connect_timeout=2, autocommit=True) as admin:
-        admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database)))
-    url = psycopg.conninfo.make_conninfo(_db_admin_url, dbname=database)
-    try:
-        with psycopg.connect(url, connect_timeout=2) as conn:
-            db_module.migrate(conn)
-        yield url
-    finally:
-        with psycopg.connect(_db_admin_url, connect_timeout=2, autocommit=True) as admin:
-            admin.execute(sql.SQL("DROP DATABASE {} WITH (FORCE)").format(sql.Identifier(database)))
+    return db_url_factory()
 
 
 @pytest.fixture()
