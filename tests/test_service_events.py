@@ -1,15 +1,19 @@
-"""Tests for the ingestion payload models.
+"""Tests for the ingestion payload models and their conversion to state events.
 
 The rules these tests pin:
 
 - Payloads carry exactly the contract columns: the fields the shared
   cohort and feature modules read, plus the identity fields idempotent
   ingestion needs (ENCOUNTER and CODE for medications, ENCOUNTER for
-  conditions, which have no Synthea row Id).
+  conditions, which have no Synthea row Id). The column sets are the
+  same tuples ``state`` declares, asserted rather than restated, so the
+  wire schema cannot drift away from the stored schema.
 - Values are verbatim CSV strings: format-checked, never converted, so a
-  validated payload round-trips to the exact posted dict.
-- Extra fields, missing fields, malformed timestamps, empty identity
-  fields, and unknown event types are all rejected loudly.
+  validated payload round-trips to the exact posted dict and converts to
+  a state event carrying the identical strings.
+- The wire layer owns shape (unknown fields, missing fields, unknown
+  event types); ``state`` owns format, and every format rule is checked
+  exactly once, at conversion, raising MalformedEventError.
 - Empty STOP is accepted everywhere the export can leave it empty (open
   stays, ongoing medications, unresolved conditions) and an empty
   DEATHDATE marks a living patient.
@@ -29,12 +33,14 @@ from factories import (
     make_medication_row,
     make_patient_row,
 )
+from risk_scoring import state
 from risk_scoring.service.events import (
     ConditionPayload,
     EncounterPayload,
     Event,
     MedicationPayload,
     PatientPayload,
+    to_state_event,
 )
 
 _EVENT_ADAPTER: TypeAdapter[Event] = TypeAdapter(Event)
@@ -47,6 +53,30 @@ PATIENT_FIELDS = ("Id", "BIRTHDATE", "DEATHDATE")
 
 def _project(row: dict[str, str], fields: tuple[str, ...]) -> dict[str, str]:
     return {field: row[field] for field in fields}
+
+
+def _convert(event_type: str, payload: dict[str, str]) -> state.AnyEvent:
+    """Validate a posted envelope and convert it, as the service does."""
+    envelope = _EVENT_ADAPTER.validate_python({"event_type": event_type, "payload": payload})
+    return to_state_event(envelope)
+
+
+# --- the wire schema tracks the stored schema ---
+
+
+@pytest.mark.parametrize(
+    ("payload_cls", "columns"),
+    [
+        (PatientPayload, state.PATIENT_COLUMNS),
+        (EncounterPayload, state.ENCOUNTER_COLUMNS),
+        (MedicationPayload, state.MEDICATION_COLUMNS),
+        (ConditionPayload, state.CONDITION_COLUMNS),
+    ],
+)
+def test_payload_fields_are_exactly_the_state_columns(
+    payload_cls: type[EncounterPayload], columns: tuple[str, ...]
+) -> None:
+    assert set(payload_cls.model_fields) == set(columns)
 
 
 # --- verbatim round-trips ---
@@ -72,7 +102,40 @@ def test_patient_payload_preserves_factory_row_verbatim() -> None:
     assert PatientPayload.model_validate(projected).model_dump() == projected
 
 
-# --- rejections ---
+# --- conversion to state events ---
+
+
+def test_encounter_envelope_converts_to_state_event_verbatim() -> None:
+    row = make_encounter_row(ENCOUNTERCLASS="inpatient")
+    event = _convert("encounter", _project(row, ENCOUNTER_FIELDS))
+    assert event == state.EncounterEvent(
+        id=row["Id"],
+        start=row["START"],
+        stop=row["STOP"],
+        patient=row["PATIENT"],
+        encounter_class="inpatient",
+    )
+
+
+def test_medication_envelope_converts_to_state_event_verbatim() -> None:
+    row = make_medication_row()
+    event = _convert("medication", _project(row, MEDICATION_FIELDS))
+    assert event == state.MedicationEvent.from_row(_project(row, MEDICATION_FIELDS))
+
+
+def test_condition_envelope_converts_to_state_event_verbatim() -> None:
+    row = make_condition_row()
+    event = _convert("condition", _project(row, CONDITION_FIELDS))
+    assert event == state.ConditionEvent.from_row(_project(row, CONDITION_FIELDS))
+
+
+def test_patient_envelope_converts_to_state_event_verbatim() -> None:
+    row = make_patient_row()
+    event = _convert("patient", _project(row, PATIENT_FIELDS))
+    assert event == state.PatientEvent.from_row(_project(row, PATIENT_FIELDS))
+
+
+# --- shape rejections belong to the wire layer ---
 
 
 def test_full_synthea_row_with_extra_columns_rejected() -> None:
@@ -87,50 +150,53 @@ def test_missing_required_field_rejected() -> None:
         EncounterPayload.model_validate(projected)
 
 
+# --- format rejections belong to state, and happen at conversion ---
+
+
 @pytest.mark.parametrize(
     "start",
     ["2024-01-01", "2024-01-01 08:00:00", "01/01/2024T08:00:00Z", "not-a-time", ""],
 )
 def test_malformed_encounter_start_rejected(start: str) -> None:
     projected = _project(make_encounter_row(START=start), ENCOUNTER_FIELDS)
-    with pytest.raises(ValidationError):
-        EncounterPayload.model_validate(projected)
+    assert EncounterPayload.model_validate(projected).model_dump()["START"] == start
+    with pytest.raises(state.MalformedEventError):
+        _convert("encounter", projected)
 
 
 def test_datetime_where_condition_date_expected_rejected() -> None:
     projected = _project(make_condition_row(START="2024-01-01T08:00:00Z"), CONDITION_FIELDS)
-    with pytest.raises(ValidationError):
-        ConditionPayload.model_validate(projected)
+    with pytest.raises(state.MalformedEventError):
+        _convert("condition", projected)
 
 
 @pytest.mark.parametrize("field", ["Id", "PATIENT"])
 def test_empty_encounter_identity_field_rejected(field: str) -> None:
     projected = _project(make_encounter_row(**{field: ""}), ENCOUNTER_FIELDS)
-    with pytest.raises(ValidationError):
-        EncounterPayload.model_validate(projected)
+    with pytest.raises(state.MalformedEventError):
+        _convert("encounter", projected)
 
 
 def test_empty_patient_id_rejected() -> None:
     projected = _project(make_patient_row(Id=""), PATIENT_FIELDS)
-    with pytest.raises(ValidationError):
-        PatientPayload.model_validate(projected)
+    with pytest.raises(state.MalformedEventError):
+        _convert("patient", projected)
 
 
 # --- empty STOP and DEATHDATE ---
 
 
 def test_empty_stop_accepted_on_all_clinical_payloads() -> None:
-    encounter = _project(make_encounter_row(STOP=""), ENCOUNTER_FIELDS)
-    medication = _project(make_medication_row(STOP=""), MEDICATION_FIELDS)
-    condition = _project(make_condition_row(STOP=""), CONDITION_FIELDS)
-    assert EncounterPayload.model_validate(encounter).STOP == ""
-    assert MedicationPayload.model_validate(medication).STOP == ""
-    assert ConditionPayload.model_validate(condition).STOP == ""
+    encounter = _convert("encounter", _project(make_encounter_row(STOP=""), ENCOUNTER_FIELDS))
+    medication = _convert("medication", _project(make_medication_row(STOP=""), MEDICATION_FIELDS))
+    condition = _convert("condition", _project(make_condition_row(STOP=""), CONDITION_FIELDS))
+    assert (encounter.stop, medication.stop, condition.stop) == ("", "", "")
 
 
 def test_empty_deathdate_accepted_for_living_patient() -> None:
-    projected = _project(make_patient_row(DEATHDATE=""), PATIENT_FIELDS)
-    assert PatientPayload.model_validate(projected).DEATHDATE == ""
+    patient = _convert("patient", _project(make_patient_row(DEATHDATE=""), PATIENT_FIELDS))
+    assert isinstance(patient, state.PatientEvent)
+    assert patient.deathdate == ""
 
 
 # --- envelope discrimination ---

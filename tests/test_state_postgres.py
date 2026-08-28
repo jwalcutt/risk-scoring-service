@@ -246,3 +246,29 @@ def test_same_drug_same_encounter_same_start_but_different_stop_are_distinct(
         "2016-11-23T03:09:52Z",
         "2017-11-29T03:09:52Z",
     ]
+
+
+@pytest.mark.parametrize(("label", "factory", "event_name", "_record_name"), EVENT_TYPES)
+def test_record_event_dispatches_on_the_event_type(
+    db_conn: psycopg.Connection[Any],
+    label: str,
+    factory: RowFactory,
+    event_name: str,
+    _record_name: str,
+) -> None:
+    """One entry point for callers that hold an event without knowing its kind."""
+    row = factory()
+    event = getattr(state, event_name).from_row(row)
+
+    assert state.record_event(db_conn, event) is True
+    assert state.record_event(db_conn, event) is False
+
+    patient = row["Id"] if label == "patient" else row["PATIENT"]
+    history = state.patient_history(db_conn, patient)
+    stored = {
+        "patient": history.patients,
+        "encounter": history.encounters,
+        "medication": history.medications,
+        "condition": history.conditions,
+    }[label]
+    assert len(stored) == 1

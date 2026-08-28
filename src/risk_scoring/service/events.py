@@ -2,12 +2,21 @@
 
 Payload schemas mirror the Synthea CSV columns the shared cohort and
 feature modules read, so a validated payload maps to a CSV row by
-identity. Track A's state layer adopts these models at the merge.
+identity. :func:`to_state_event` converts one into the matching
+:mod:`risk_scoring.state` event, which is what gets persisted.
 
 Judgment calls this module fixes:
 
-- Every field is a verbatim CSV string: format-checked, never converted.
-  Values must round-trip exactly (zero-padded timestamps), keeping
+- The wire layer owns shape; ``state`` owns format. These models declare
+  the field set and reject anything structurally wrong (missing field,
+  unknown field, unknown event type) with FastAPI's 422. Every value
+  rule — required-and-non-empty, the exact timestamp and date formats,
+  which fields may be empty — lives once, in the ``state`` event
+  dataclasses, and fires at conversion. Two copies of the format rules
+  existed briefly while the ingestion boundary and the state layer were
+  built in parallel; collapsing them is what keeps the wire schema and
+  the stored schema from drifting apart.
+- Every field is a verbatim CSV string, never converted, keeping
   "unmodified field values" literal for the input hash and letting state
   rebuild frames byte-identical to the batch export.
 - Payloads carry only the columns the shared modules read, plus the
@@ -20,37 +29,15 @@ Judgment calls this module fixes:
   the patient's first clinical event.
 - ``extra="forbid"`` everywhere: an unknown field is a loud 422, never a
   silent drop, and the hashed bytes only ever contain contracted fields.
-- Empty STOP stays allowed (open stays, ongoing medications, unresolved
-  conditions), matching what the feature module already handles; an
-  empty DEATHDATE marks a living patient.
 """
 
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field
 
-_TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
-_DATE_FORMAT = "%Y-%m-%d"
-
-
-def _check_exact_format(value: str, fmt: str, label: str) -> str:
-    """Require a value that round-trips through the format unchanged."""
-    try:
-        parsed = datetime.strptime(value, fmt)
-    except ValueError as exc:
-        raise ValueError(f"{label} must match {fmt!r}; got {value!r}") from exc
-    if parsed.strftime(fmt) != value:
-        raise ValueError(f"{label} must match {fmt!r} exactly; got {value!r}")
-    return value
-
-
-def _non_empty(value: str, label: str) -> str:
-    if not value:
-        raise ValueError(f"{label} must not be empty")
-    return value
+from risk_scoring import state
 
 
 class _StrictModel(BaseModel):
@@ -64,23 +51,6 @@ class EncounterPayload(_StrictModel):
     PATIENT: str
     ENCOUNTERCLASS: str
 
-    @field_validator("Id", "PATIENT", "ENCOUNTERCLASS")
-    @classmethod
-    def _identity_non_empty(cls, value: str) -> str:
-        return _non_empty(value, "encounter identity field")
-
-    @field_validator("START")
-    @classmethod
-    def _start_is_timestamp(cls, value: str) -> str:
-        return _check_exact_format(value, _TIMESTAMP_FORMAT, "encounter START")
-
-    @field_validator("STOP")
-    @classmethod
-    def _stop_is_timestamp_or_empty(cls, value: str) -> str:
-        if value == "":
-            return value
-        return _check_exact_format(value, _TIMESTAMP_FORMAT, "encounter STOP")
-
 
 class MedicationPayload(_StrictModel):
     START: str
@@ -88,23 +58,6 @@ class MedicationPayload(_StrictModel):
     PATIENT: str
     ENCOUNTER: str
     CODE: str
-
-    @field_validator("PATIENT", "ENCOUNTER", "CODE")
-    @classmethod
-    def _identity_non_empty(cls, value: str) -> str:
-        return _non_empty(value, "medication identity field")
-
-    @field_validator("START")
-    @classmethod
-    def _start_is_timestamp(cls, value: str) -> str:
-        return _check_exact_format(value, _TIMESTAMP_FORMAT, "medication START")
-
-    @field_validator("STOP")
-    @classmethod
-    def _stop_is_timestamp_or_empty(cls, value: str) -> str:
-        if value == "":
-            return value
-        return _check_exact_format(value, _TIMESTAMP_FORMAT, "medication STOP")
 
 
 class ConditionPayload(_StrictModel):
@@ -116,68 +69,52 @@ class ConditionPayload(_StrictModel):
     CODE: str
     DESCRIPTION: str
 
-    @field_validator("PATIENT", "ENCOUNTER", "SYSTEM", "CODE")
-    @classmethod
-    def _identity_non_empty(cls, value: str) -> str:
-        return _non_empty(value, "condition identity field")
-
-    @field_validator("START")
-    @classmethod
-    def _start_is_date(cls, value: str) -> str:
-        return _check_exact_format(value, _DATE_FORMAT, "condition START")
-
-    @field_validator("STOP")
-    @classmethod
-    def _stop_is_date_or_empty(cls, value: str) -> str:
-        if value == "":
-            return value
-        return _check_exact_format(value, _DATE_FORMAT, "condition STOP")
-
 
 class PatientPayload(_StrictModel):
     Id: str
     BIRTHDATE: str
     DEATHDATE: str
 
-    @field_validator("Id")
-    @classmethod
-    def _id_non_empty(cls, value: str) -> str:
-        return _non_empty(value, "patient Id")
 
-    @field_validator("BIRTHDATE")
-    @classmethod
-    def _birthdate_is_date(cls, value: str) -> str:
-        return _check_exact_format(value, _DATE_FORMAT, "patient BIRTHDATE")
-
-    @field_validator("DEATHDATE")
-    @classmethod
-    def _deathdate_is_date_or_empty(cls, value: str) -> str:
-        if value == "":
-            return value
-        return _check_exact_format(value, _DATE_FORMAT, "patient DEATHDATE")
-
-
-class EncounterEvent(_StrictModel):
+class EncounterEnvelope(_StrictModel):
     event_type: Literal["encounter"]
     payload: EncounterPayload
 
 
-class MedicationEvent(_StrictModel):
+class MedicationEnvelope(_StrictModel):
     event_type: Literal["medication"]
     payload: MedicationPayload
 
 
-class ConditionEvent(_StrictModel):
+class ConditionEnvelope(_StrictModel):
     event_type: Literal["condition"]
     payload: ConditionPayload
 
 
-class PatientEvent(_StrictModel):
+class PatientEnvelope(_StrictModel):
     event_type: Literal["patient"]
     payload: PatientPayload
 
 
 Event = Annotated[
-    EncounterEvent | MedicationEvent | ConditionEvent | PatientEvent,
+    EncounterEnvelope | MedicationEnvelope | ConditionEnvelope | PatientEnvelope,
     Field(discriminator="event_type"),
 ]
+
+_STATE_EVENT_BY_TYPE: dict[str, type[state.AnyEvent]] = {
+    "encounter": state.EncounterEvent,
+    "medication": state.MedicationEvent,
+    "condition": state.ConditionEvent,
+    "patient": state.PatientEvent,
+}
+
+
+def to_state_event(event: Event) -> state.AnyEvent:
+    """Convert a validated envelope into the state event it persists as.
+
+    Raises :class:`risk_scoring.state.MalformedEventError` when a field
+    value fails its format rule; the payload dict keys are the uppercase
+    Synthea column names the ``from_row`` constructors already expect, so
+    the conversion is a lookup, never a re-listing of the columns.
+    """
+    return _STATE_EVENT_BY_TYPE[event.event_type].from_row(event.payload.model_dump())

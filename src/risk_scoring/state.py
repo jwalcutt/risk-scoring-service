@@ -175,6 +175,10 @@ class ConditionEvent:
         )
 
 
+AnyEvent = PatientEvent | EncounterEvent | MedicationEvent | ConditionEvent
+"""Any recordable event. The service's wire models convert into this union."""
+
+
 @dataclass(frozen=True)
 class _TableSpec:
     """One state table: database columns (event field names) and its natural key."""
@@ -277,6 +281,24 @@ def record_medication(conn: psycopg.Connection[Any], event: MedicationEvent) -> 
 def record_condition(conn: psycopg.Connection[Any], event: ConditionEvent) -> bool:
     """Persist a condition event; True if new, False on an identical re-post."""
     return _record(conn, _CONDITION_SPEC, asdict(event))
+
+
+_SPEC_BY_EVENT: dict[type[AnyEvent], _TableSpec] = {
+    PatientEvent: _PATIENT_SPEC,
+    EncounterEvent: _ENCOUNTER_SPEC,
+    MedicationEvent: _MEDICATION_SPEC,
+    ConditionEvent: _CONDITION_SPEC,
+}
+
+
+def record_event(conn: psycopg.Connection[Any], event: AnyEvent) -> bool:
+    """Persist any event, dispatching on its type.
+
+    The entry point for callers that hold an event without caring which
+    kind it is, such as the ingestion endpoint. Same contract as the
+    per-type functions: True if new, False on an identical re-post.
+    """
+    return _record(conn, _SPEC_BY_EVENT[type(event)], asdict(event))
 
 
 @dataclass(frozen=True)

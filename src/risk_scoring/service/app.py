@@ -12,9 +12,11 @@ Judgment calls this module fixes:
 - The ingestion handler hashes the raw request body as received, before
   pydantic touches it; the validated model is never re-serialized, so
   coercion can never contaminate the input hash.
-- Ingestion is a stub until the track A merge: validate, hash,
-  acknowledge with 202, store nothing. Malformed payloads get FastAPI's
-  default 422 with detail, which is the contract's reject-with-4xx.
+- Ingestion is a stub until the state layer is wired in: validate,
+  hash, acknowledge with 202, store nothing. Structurally invalid
+  payloads get FastAPI's default 422; format failures surface as
+  MalformedEventError from the conversion and are mapped to the same
+  422, so the contract's reject-with-4xx holds for both.
 """
 
 from __future__ import annotations
@@ -27,13 +29,15 @@ from pathlib import Path
 
 import mlflow
 from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from mlflow.exceptions import MlflowException
 
 from risk_scoring.cohort import COHORT_VERSION
 from risk_scoring.features import FEATURE_VERSION
 from risk_scoring.payload_hash import payload_hash
 from risk_scoring.service.config import ServiceConfig
-from risk_scoring.service.events import Event
+from risk_scoring.service.events import Event, to_state_event
+from risk_scoring.state import MalformedEventError
 from risk_scoring.tracking import configure_tracking, tracking_uri
 
 
@@ -76,6 +80,11 @@ def create_app(config: ServiceConfig, repo_root: Path) -> FastAPI:
 
     app = FastAPI(title="risk-scoring-service", lifespan=lifespan)
 
+    @app.exception_handler(MalformedEventError)
+    async def malformed_event(request: Request, exc: Exception) -> JSONResponse:
+        """A field that fails its format rule is a 4xx, same as a bad shape."""
+        return JSONResponse(status_code=422, content={"detail": str(exc)})
+
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
@@ -95,6 +104,7 @@ def create_app(config: ServiceConfig, repo_root: Path) -> FastAPI:
     @app.post("/events", status_code=202)
     async def ingest(event: Event, request: Request) -> dict[str, str]:
         raw_event = json.loads(await request.body())
+        to_state_event(event)
         return {
             "status": "accepted",
             "event_type": event.event_type,
