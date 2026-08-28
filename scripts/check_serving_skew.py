@@ -34,39 +34,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "tests"))
 
 from factories import ordered_events  # noqa: E402
+from population_sample import load_population, sample_patients  # noqa: E402
 from risk_scoring import db as db_module  # noqa: E402
 from risk_scoring import serving, state  # noqa: E402
 from risk_scoring.cohort import build_cohort  # noqa: E402
 from risk_scoring.features import FEATURE_COLUMNS, build_features  # noqa: E402
-
-
-def load_population(csv_dir: Path) -> dict[str, pd.DataFrame]:
-    """Read a population's CSVs exactly as the training pipeline reads them."""
-    return {
-        name: pd.read_csv(csv_dir / f"{name}.csv", dtype=str, keep_default_na=False)
-        for name in ("patients", "encounters", "medications", "conditions")
-    }
-
-
-def sample_patients(
-    frames: dict[str, pd.DataFrame], *, count: int, seed: int
-) -> dict[str, pd.DataFrame]:
-    """Restrict every frame to a seeded sample of patients with a cohort discharge.
-
-    Sampling from cohort patients keeps the run informative: a sample of
-    all patients would be mostly people the service never scores.
-    """
-    cohort = build_cohort(frames["encounters"], frames["patients"]).frame
-    eligible = pd.Index(cohort["patient_id"].unique())
-    chosen = set(
-        eligible.to_series().sample(n=min(count, len(eligible)), random_state=seed).tolist()
-    )
-    return {
-        "patients": frames["patients"].loc[frames["patients"]["Id"].isin(chosen)],
-        "encounters": frames["encounters"].loc[frames["encounters"]["PATIENT"].isin(chosen)],
-        "medications": frames["medications"].loc[frames["medications"]["PATIENT"].isin(chosen)],
-        "conditions": frames["conditions"].loc[frames["conditions"]["PATIENT"].isin(chosen)],
-    }
 
 
 def replay(conn: psycopg.Connection[Any], frames: dict[str, pd.DataFrame]) -> pd.DataFrame:
