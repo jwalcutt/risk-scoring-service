@@ -185,9 +185,59 @@ The pin must be an explicit positive integer. The loader rejects strings (includ
 
 ## How the container reaches the registry
 
-Decision: when the service gets its own Compose block, the container bind-mounts `mlflow.db` and `mlruns/` read-only. One registry stays the single source of truth for training, gating, and serving, and promotion remains an edit to one committed config value. The alternative, baking the model artifact into the image at build time, was rejected as the default because it forks the registry into per-image copies; it remains the recorded fallback if the mount proves brittle.
+Decision, taken before the container existed: bind-mount `mlflow.db` and `mlruns/` rather than bake the model artifact into the image. One registry stays the single source of truth for training, gating, and serving, and promotion remains an edit to one committed config value. Baking the artifact in at build time forks the registry into per-image copies; it remains the recorded fallback.
 
-Two known risks may trigger that fallback, and the restart tests against real containers will decide. First, `configure_tracking` pins each experiment's artifact location as an absolute `file://` URI of the training machine, and model loading resolves artifacts through the URI stored in the database, so the mount must reproduce the host's absolute path inside the container or the stored URIs must be regenerated. Second, SQLite on a read-only bind mount can fail on lock or journal acquisition depending on journal state; opening the database with `mode=ro&immutable=1`, or copying it in at startup, are the candidate mitigations. No Dockerfile exists yet: nothing in the service shell requires a container, and the service's Compose block waits until the ingestion path writes state, so the shared Compose file grows in one place at a time.
+Two risks were recorded against that decision. Building the container settled both, and turned up a third that had not been anticipated.
+
+The absolute-path risk was real and is handled by construction. `configure_tracking` pins each experiment's artifact location as an absolute `file://` URI, and every registered version's `storage_location` carries the training machine's own path, so a mount at any other path resolves to nothing. Compose therefore interpolates `${PWD}` into both the mounts and the container's working directory, which puts `mlflow.db` and `mlruns/` at exactly the paths the stored URIs name. The service's repo root is its working directory, so `configure_tracking` derives the same SQLite path inside the container as on the host. This is why the stack must be started from the repository root, and why any clone works without editing the file: the interpolation follows the clone.
+
+The SQLite risk did not materialize. The database is in `delete` journal mode, not WAL, so a read needs no writable sidecar, and a read-only mount serves model resolution without complaint. `mlflow.db` is mounted read-only and stays that way.
+
+The third risk was the one that bit. Loading a `models:/name/version` URI is not a pure read: MLflow writes a derived `registered_model_meta` file beside the artifact on every load, recording the registered name and version the local copy came from. A read-only `mlruns/` fails that write with `OSError: [Errno 30] Read-only file system` before the model ever loads. `mlruns/` is therefore mounted writable while `mlflow.db` stays read-only, which is the narrowest thing that works: the container can rewrite a 48-byte derived sidecar that the host service already writes with identical content, and it cannot alter the registry itself, which is what "single source of truth" means here. Copying the artifact store into the container at startup would restore full immutability at the cost of an entrypoint script and a per-start copy; that is the recorded escalation if a later phase needs the artifact store genuinely untouchable.
+
+## The container and the Compose stack
+
+`docker compose up -d --build`, run from the repository root, brings up three services:
+
+| Service | Role |
+| --- | --- |
+| `postgres` | State, the prediction log, and everything later phases add. Host port 5433. |
+| `migrate` | One-shot `python -m risk_scoring.db migrate`, gated on Postgres reporting healthy. |
+| `app` | The service, gated on `migrate` completing successfully. Host port 8001. |
+
+Schema changes are a separate one-shot service rather than part of the service's own start, so restarting the service is a pure restart and never issues DDL. That keeps the restart check honest: what it exercises is a process coming back, not a schema being reapplied.
+
+Host port 8001, not 8000, for the same reason Postgres publishes on 5433: an application already listening on the usual port must never collide with the stack.
+
+The image is `python:3.12-slim` with dependencies installed from the same `uv.lock` CI installs, so the container runs the versions the tests ran against. LightGBM's wheel links against `libgomp`, which the slim base omits, so the image installs it. The service's own source is copied in; the registry, `configs/`, and the working directory arrive by mount.
+
+Two things the container forced into the service code:
+
+- The CLI gained `--host`, defaulting to `127.0.0.1`. A host process should not be reachable off the machine; the image's command asks for `0.0.0.0` explicitly, because its port is published.
+- `resolve_git_sha` now prefers `RISK_SCORING_GIT_SHA` over `git rev-parse`. An image carries no `.git`, so `/version` was reporting a null commit for the code it was built from. The build passes the SHA as an argument, placed after the dependency layers so a new commit rebuilds one cheap layer. An unset argument arrives as an empty string, which is not a SHA and falls through to the working tree, so a host process is unaffected.
+
+## Restart and state rebuild
+
+The service holds nothing across requests that it did not derive at startup: the loaded model, the connection pool, the frozen config, and the commit SHA. There is no cache, no mutable module global, and no per-patient memory anywhere in the package. Every value a score depends on is read back from Postgres on the request that needs it, so the rebuild path is structurally trivial: a fresh instance scores correctly from history it never saw arrive, with no warm-up and nothing to prime.
+
+That is a property worth keeping rather than rediscovering, so a test restates the set of names the lifespan writes onto the app state. Adding a per-patient cache later breaks that test instead of passing review.
+
+The equivalence check is the substantive one. It posts one event stream twice, once straight through and once with the app torn down and rebuilt partway, and requires the two prediction logs to be equal row for row. Six restart points are covered: before the first event, after the first, mid-stream, immediately before a discharge, immediately after one, and after the last event. A separate case reopens the crash window across the restart, writing an encounter through the state layer directly so it is durable while its score is not, then bringing a fresh instance up and posting that encounter; the log is what decides whether to score, so the new instance scores it. Two mutations confirm the tests bite: deciding to score on the state write rather than on the log breaks the crash-window case, and caching a patient's history in the process breaks every equivalence case.
+
+`prediction_id` and `scored_at` are excluded from the comparison, and the reason is worth stating because it looks like a gap. The database assigns both. A `bigserial` evaluates `nextval` before the conflict check, so a dropped re-post consumes an id: writing `encounter-1`, re-posting it, then writing `encounter-2` leaves ids 1 and 3. A resume that revisits scored discharges therefore gaps the sequence by design, and comparing two runs by id would fail on a system behaving correctly. What must match is the content and the order, and a test pins the gap behavior so the exclusion is a recorded fact rather than a convenience.
+
+## Restart equivalence confirmed against the containers
+
+Recorded 2026-08-28. The frozen populations are local-only, so this cannot run in CI:
+
+```bash
+python scripts/check_restart_equivalence.py --population baseline --patients 25
+```
+
+A seeded sample of 25 baseline patients, 5,641 events posted one at a time over HTTP to the running stack, in two arms against two throwaway databases. The first arm ran straight through. The second stopped and started the service container after 2,820 events, waited for it to report healthy again, and posted the remaining 2,821. Both arms scored 42 discharges, and every logged field of every row was identical: same encounters, same order, same input hashes, same scores, same feature values. Runtime 55 seconds for both arms including the image build check.
+
+The script asserts the container actually cycled, comparing Docker's `StartedAt` for the service container across the restart. Without that check, a restart that silently did nothing would let a service holding state in memory print a match, which is precisely the failure the run exists to catch; skipping the restart call makes the script fail rather than pass.
+
 
 ## Provenance confirmed on generated data
 

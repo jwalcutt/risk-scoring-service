@@ -52,14 +52,20 @@ A test in CI asserts that the two paths agree. It builds a population that lands
 
 ## Running the scoring service
 
-The service scores one event stream, in timestamp order, one event at a time. Start Postgres, apply the migrations, then serve:
+The service scores one event stream, in timestamp order, one event at a time. The whole stack comes up with one command, run from the repository root:
 
 ```bash
-docker compose up -d postgres && python -m risk_scoring.db migrate
+GIT_SHA=$(git rev-parse HEAD) docker compose up -d --build
 ```
 
+That starts Postgres, applies the schema through a one-shot migration service, and then serves on `http://localhost:8001`. Migrations are a separate service rather than part of the service's own start, so restarting the service never issues schema changes. The commit SHA is passed in because the image carries no `.git`, and the version endpoint reports it.
+
+The service reads the model registry from the host through a read-only mount, so one registry serves training, gating, and scoring. Compose resolves the mount paths from the working directory, which is why the stack must be started from the repository root; any clone works without editing the file.
+
+Running it as a host process instead needs Postgres and the migrations first:
+
 ```bash
-python -m risk_scoring.service run
+docker compose up -d postgres && python -m risk_scoring.db migrate && python -m risk_scoring.service run
 ```
 
 Startup loads the model version pinned in `configs/service.toml` from the MLflow registry and opens a connection pool. Either one failing stops the service from starting, so a 200 from the health endpoint means the service can actually score and store rather than that a process is alive. The pin must be an explicit registered version number: strings, aliases, and "latest" are rejected, and no code path resolves the newest version.
@@ -81,6 +87,12 @@ Every score is written with the provenance needed to reconstruct it later: the p
 A discharge has exactly one score, enforced by the database rather than by convention, so replaying a stream cannot duplicate history or rewrite it. That uniqueness is also what makes an interrupted run safe to resume: whether a discharge still needs scoring is decided by whether the log holds it, not by whether the event was new, so an event that was stored while its score was not gets scored when the stream replays it.
 
 A worked trace against generated data, from a logged row back through its input hash and model version to an exact re-score, is recorded in [docs/service-notes.md](docs/service-notes.md).
+
+## Restarting without losing anything
+
+The service keeps nothing across requests that it did not derive at startup: the loaded model, the connection pool, the pinned config, and the commit SHA. Every value a score depends on is read back from Postgres on the request that needs it, so a fresh instance scores correctly from history it never saw arrive, with no warm-up and no cache to prime.
+
+A test in CI proves that rather than asserting it. It posts one event stream twice, once straight through and once with the service torn down and rebuilt partway, and requires the two prediction logs to be equal row for row: same discharges, same order, same input hashes, same scores, none missing and none written twice. Six restart points are covered, including immediately before and immediately after a discharge, and the case that matters most, an encounter whose state write landed while its score did not. The same comparison against the real containers, restarting the service with `docker compose restart`, matched on all 42 discharges of a 25-patient sample; [docs/service-notes.md](docs/service-notes.md) records that run.
 
 ## Labels and training
 
@@ -116,4 +128,4 @@ That command goes from raw generator output to a registered model version, gates
 
 Early in development. The data spine exists (frozen synthetic populations plus verification tooling), the cohort, feature, and label layers are implemented and tested, and a single command retrains from raw generator output into a registered model version and a gate report, with results recorded in [docs/training-notes.md](docs/training-notes.md) and [docs/gate-notes.md](docs/gate-notes.md).
 
-The service now runs: it ingests events over HTTP into Postgres-backed per-patient state, scores admitted discharges through the same feature module the training pipeline uses, and logs every prediction with full provenance. Training-serving agreement is asserted in CI and confirmed against generated data. What does not exist yet is the replay harness that drives the stream on a simulated clock, so events are posted by scripted batches rather than streamed, and no monitoring or retraining loop reads the prediction log yet.
+The service now runs as a container stack: it ingests events over HTTP into Postgres-backed per-patient state, scores admitted discharges through the same feature module the training pipeline uses, and logs every prediction with full provenance. Training-serving agreement is asserted in CI and confirmed against generated data, and so is restart equivalence. What does not exist yet is the replay harness that drives the stream on a simulated clock, so events are posted by scripted batches rather than streamed, and no monitoring or retraining loop reads the prediction log yet.
