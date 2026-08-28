@@ -30,16 +30,15 @@ import pandas as pd
 import psycopg
 from psycopg import sql
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO_ROOT / "tests"))
+from population_sample import sample_patients
+from risk_scoring import db as db_module
+from risk_scoring import serving, state
+from risk_scoring.cohort import build_cohort
+from risk_scoring.features import FEATURE_COLUMNS, build_features
+from risk_scoring.populations import load_population
+from risk_scoring.stream import ordered_events
 
-from factories import ordered_events  # noqa: E402
-from population_sample import sample_patients  # noqa: E402
-from risk_scoring import db as db_module  # noqa: E402
-from risk_scoring import serving, state  # noqa: E402
-from risk_scoring.cohort import build_cohort  # noqa: E402
-from risk_scoring.features import FEATURE_COLUMNS, build_features  # noqa: E402
-from risk_scoring.populations import load_population  # noqa: E402
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def replay(conn: psycopg.Connection[Any], frames: dict[str, pd.DataFrame]) -> pd.DataFrame:

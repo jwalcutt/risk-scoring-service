@@ -33,48 +33,20 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-import pandas as pd
 import psycopg
 from psycopg import sql
 
+from population_sample import sample_patients
+from risk_scoring import db as db_module
+from risk_scoring import predictions
+from risk_scoring.populations import load_population
+from risk_scoring.stream import build_stream
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO_ROOT / "tests"))
 
-from factories import ordered_events  # noqa: E402
-from population_sample import sample_patients  # noqa: E402
-from risk_scoring import db as db_module  # noqa: E402
-from risk_scoring import predictions  # noqa: E402
-from risk_scoring.populations import load_population  # noqa: E402
-
-EVENT_FIELDS: dict[str, tuple[str, ...]] = {
-    "patient": ("Id", "BIRTHDATE", "DEATHDATE"),
-    "encounter": ("Id", "START", "STOP", "PATIENT", "ENCOUNTERCLASS"),
-    "medication": ("START", "STOP", "PATIENT", "ENCOUNTER", "CODE"),
-    "condition": ("START", "STOP", "PATIENT", "ENCOUNTER", "SYSTEM", "CODE", "DESCRIPTION"),
-}
 VOLATILE_COLUMNS = ("prediction_id", "scored_at")
 DEFAULT_SERVICE_PORT = 8001
 HEALTH_TIMEOUT_SECONDS = 180.0
-
-
-def build_stream(frames: dict[str, pd.DataFrame]) -> list[dict[str, Any]]:
-    """The population as one ordered event stream, demographics first.
-
-    Demographics lead because the cohort rules need a birthdate: a
-    discharge that outran its patient is refused, not scored.
-    """
-
-    def event(kind: str, row: dict[str, str]) -> dict[str, Any]:
-        return {"event_type": kind, "payload": {name: row[name] for name in EVENT_FIELDS[kind]}}
-
-    stream = [event("patient", dict(row)) for _, row in frames["patients"].iterrows()]
-    stream += [
-        event(item.kind, item.row)
-        for item in ordered_events(
-            frames["encounters"], frames["medications"], frames["conditions"]
-        )
-    ]
-    return stream
 
 
 def compose(arguments: list[str], env: dict[str, str]) -> None:

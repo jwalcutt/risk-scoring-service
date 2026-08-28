@@ -34,27 +34,15 @@ import psycopg
 import pytest
 from fastapi.testclient import TestClient
 
-from factories import (
-    StreamEvent,
-    make_encounter_row,
-    make_patient_row,
-    ordered_events,
-    write_skew_population,
-)
+from factories import make_encounter_row, make_patient_row, write_skew_population
 from risk_scoring import predictions, state, train
 from risk_scoring.cohort import build_cohort
 from risk_scoring.service.app import create_app
 from risk_scoring.service.config import ServiceConfig
+from risk_scoring.stream import EVENT_FIELDS, build_stream
 from risk_scoring.train import MODEL_NAME
 
 pytestmark = pytest.mark.db
-
-_EVENT_FIELDS: dict[str, tuple[str, ...]] = {
-    "patient": ("Id", "BIRTHDATE", "DEATHDATE"),
-    "encounter": ("Id", "START", "STOP", "PATIENT", "ENCOUNTERCLASS"),
-    "medication": ("START", "STOP", "PATIENT", "ENCOUNTER", "CODE"),
-    "condition": ("START", "STOP", "PATIENT", "ENCOUNTER", "SYSTEM", "CODE", "DESCRIPTION"),
-}
 
 # Assigned by the database, so they differ between two runs of one stream
 # by design and say nothing about whether the runs agree.
@@ -62,7 +50,8 @@ _VOLATILE_COLUMNS = ("prediction_id", "scored_at")
 
 
 def _event(kind: str, row: dict[str, str]) -> dict[str, Any]:
-    return {"event_type": kind, "payload": {name: row[name] for name in _EVENT_FIELDS[kind]}}
+    """One hand-built row as a posted envelope, projected like the stream."""
+    return {"event_type": kind, "payload": {name: row[name] for name in EVENT_FIELDS[kind]}}
 
 
 @pytest.fixture(scope="module")
@@ -79,11 +68,7 @@ def population(tmp_path_factory: pytest.TempPathFactory) -> dict[str, pd.DataFra
 @pytest.fixture(scope="module")
 def stream(population: dict[str, pd.DataFrame]) -> list[dict[str, Any]]:
     """The whole population as one ordered event stream, demographics first."""
-    events = [_event("patient", dict(row)) for _, row in population["patients"].iterrows()]
-    ordered: list[StreamEvent] = ordered_events(
-        population["encounters"], population["medications"], population["conditions"]
-    )
-    return events + [_event(item.kind, item.row) for item in ordered]
+    return build_stream(population)
 
 
 @pytest.fixture()

@@ -17,10 +17,11 @@ import pandas as pd
 import psycopg
 import pytest
 
-from factories import ordered_events, write_skew_population
+from factories import write_skew_population
 from risk_scoring import serving, state
 from risk_scoring.cohort import build_cohort
 from risk_scoring.features import FEATURE_COLUMNS, build_features
+from risk_scoring.stream import ordered_events
 
 pytestmark = pytest.mark.db
 
