@@ -8,6 +8,20 @@ on:
 jobs:
   checks:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17.6-alpine
+        env:
+          POSTGRES_USER: risk
+          POSTGRES_PASSWORD: risk
+          POSTGRES_DB: risk_scoring
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U risk -d risk_scoring"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     steps:
       - name: Check out repository
         uses: actions/checkout@v7.0.1
@@ -33,6 +47,9 @@ jobs:
 
       - name: Test (pytest)
         run: uv run pytest
+        env:
+          RISK_SCORING_REQUIRE_DB: "1"
+          RISK_SCORING_DATABASE_URL: postgresql://risk:risk@localhost:5433/risk_scoring
 
       - name: Evaluation gate (synthetic population)
         run: uv run python scripts/run_gate_ci.py --report gate_report.md

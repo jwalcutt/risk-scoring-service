@@ -35,7 +35,8 @@ packages = ["src/risk_scoring"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+addopts = "-q -ra"
+markers = ["db: requires a reachable PostgreSQL server"]
 
 [tool.ruff]
 line-length = 100

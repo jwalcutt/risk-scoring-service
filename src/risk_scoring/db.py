@@ -28,12 +28,16 @@ Judgment calls this module fixes:
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import os
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
+
+import psycopg
 
 MIGRATIONS_DIR = Path(__file__).parent / "migrations"
 
@@ -119,3 +123,70 @@ def pending_migrations(
                 "must never be edited"
             )
     return [migration for migration in discovered if migration.number not in applied]
+
+
+def applied_migrations(conn: psycopg.Connection[Any]) -> dict[int, str]:
+    """Recorded migrations as ``{number: checksum}``; empty before bootstrap."""
+    exists = conn.execute("SELECT to_regclass('public.schema_migrations')").fetchone()
+    if exists is None or exists[0] is None:
+        return {}
+    rows = conn.execute("SELECT number, checksum FROM schema_migrations").fetchall()
+    return {row[0]: row[1] for row in rows}
+
+
+def migrate(
+    conn: psycopg.Connection[Any], migrations_dir: Path = MIGRATIONS_DIR
+) -> list[Migration]:
+    """Apply every pending migration in order; return what was applied.
+
+    Each migration executes in its own transaction together with its
+    bookkeeping row, so a failure rolls that migration back completely while
+    earlier ones stay recorded.
+    """
+    pending = pending_migrations(discover_migrations(migrations_dir), applied_migrations(conn))
+    conn.commit()  # close the read-only transaction the bookkeeping query opened
+    for migration in pending:
+        try:
+            # SQL text comes from repo-committed migration files, not user input.
+            conn.execute(migration.sql)
+            conn.execute(
+                "INSERT INTO schema_migrations (number, name, checksum) VALUES (%s, %s, %s)",
+                (migration.number, migration.name, migration.checksum),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    return pending
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(
+        prog="python -m risk_scoring.db",
+        description="Apply or inspect the schema migrations.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("migrate", help="Apply every pending migration.")
+    sub.add_parser("status", help="List applied and pending migrations; change nothing.")
+    args = parser.parse_args(argv)
+
+    url = database_url()
+    with psycopg.connect(url, connect_timeout=5) as conn:
+        if args.command == "migrate":
+            applied = migrate(conn)
+            if applied:
+                for migration in applied:
+                    print(f"applied {migration.number:04d}_{migration.name}")
+            else:
+                print("nothing to apply")
+        else:
+            recorded = applied_migrations(conn)
+            discovered = discover_migrations()
+            for migration in discovered:
+                state = "applied" if migration.number in recorded else "pending"
+                print(f"{state:8s} {migration.number:04d}_{migration.name}")
+            pending_migrations(discovered, recorded)
+
+
+if __name__ == "__main__":
+    main()
