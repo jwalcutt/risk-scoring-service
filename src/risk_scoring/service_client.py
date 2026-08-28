@@ -5,6 +5,13 @@ sixty thousand requests. Judgment calls this module fixes:
 
 - One kept-alive connection carries the whole stream. A handshake per
   event would dominate the run.
+- A kept-alive connection that the service has since dropped is reopened
+  once and the request repeated. Restarting the service container is the
+  case that matters, since the caller waits for health and then posts
+  down a socket the restart already killed; an idle-timeout close has the
+  same signature. The repeat is safe because the service treats a
+  re-posted event as a no-op, and it is bounded at one so a service that
+  is genuinely gone fails instead of spinning.
 - Only 202 is success. The service answers 4xx for a malformed, out of
   order, or contradicting event, and every one of those is a defect in
   the caller's stream rather than something to count and continue past,
@@ -32,6 +39,11 @@ HEALTH_TIMEOUT_SECONDS = 180.0
 
 _ACCEPTED = 202
 _OK = 200
+
+# What a connection the far end has closed raises. RemoteDisconnected is a
+# ConnectionResetError, so both the closed-before-reply and the
+# closed-mid-write cases are covered.
+_DROPPED = (ConnectionResetError, BrokenPipeError)
 
 
 class ServiceClient:
@@ -72,12 +84,25 @@ class ServiceClient:
             )
         return self._connection
 
-    def _request(self, method: str, path: str, body: str | None = None) -> tuple[int, bytes]:
+    def _send(self, method: str, path: str, body: str | None) -> tuple[int, bytes]:
         connection = self._open()
         headers = {"content-type": "application/json"} if body is not None else {}
         connection.request(method, path, body=body, headers=headers)
         response = connection.getresponse()
         return response.status, response.read()
+
+    def _request(self, method: str, path: str, body: str | None = None) -> tuple[int, bytes]:
+        # A connection that has already carried a request and is now
+        # refused was dropped by the far end rather than never made, so it
+        # is worth reopening exactly once.
+        reusing = self._connection is not None
+        try:
+            return self._send(method, path, body)
+        except _DROPPED:
+            if not reusing:
+                raise
+            self.close()
+            return self._send(method, path, body)
 
     def wait_for_health(self, timeout: float = HEALTH_TIMEOUT_SECONDS) -> None:
         """Block until the service reports ready, or give up saying why."""
