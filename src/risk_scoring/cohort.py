@@ -20,6 +20,12 @@ Judgment calls this module fixes:
 - Excluded encounters are attributed to the first rule they fail, in the
   order: encounter class, death before admission, in-hospital death,
   under 18.
+- Encounter START/STOP are parsed under ``%Y-%m-%dT%H:%M:%SZ`` and
+  patient BIRTHDATE/DEATHDATE under ``%Y-%m-%d``, the exact formats the
+  Synthea export writes. Pandas would otherwise guess a format from the
+  first element and fall back to per-element dateutil parsing when the
+  guess fails, which is how the same digits get read two ways. A
+  non-conforming value raises here instead.
 - An inpatient encounter whose patient id has no patients.csv row raises
   rather than being dropped, because a silent drop would mask joined-data
   corruption in later replay phases.
@@ -33,6 +39,10 @@ from pathlib import Path
 import pandas as pd
 
 COHORT_VERSION = "1.0.0"
+
+TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
+DATE_FORMAT = "%Y-%m-%d"
 
 COHORT_COLUMNS = ("encounter_id", "patient_id", "start", "stop", "age_at_discharge")
 
@@ -53,7 +63,7 @@ class CohortResult:
 
 def _parse_death_dates(raw: pd.Series) -> pd.Series:
     cleaned = raw.fillna("").astype(str)
-    return pd.to_datetime(cleaned.where(cleaned != "", None), utc=True)
+    return pd.to_datetime(cleaned.where(cleaned != "", None), format=DATE_FORMAT, utc=True)
 
 
 def build_cohort(encounters: pd.DataFrame, patients: pd.DataFrame) -> CohortResult:
@@ -71,9 +81,9 @@ def build_cohort(encounters: pd.DataFrame, patients: pd.DataFrame) -> CohortResu
         orphan_ids = ", ".join(merged.loc[orphaned, "Id"])
         raise ValueError(f"inpatient encounters reference unknown patients: {orphan_ids}")
 
-    start = pd.to_datetime(merged["START"], utc=True)
-    stop = pd.to_datetime(merged["STOP"], utc=True)
-    birth = pd.to_datetime(merged["BIRTHDATE"], utc=True)
+    start = pd.to_datetime(merged["START"], format=TIMESTAMP_FORMAT, utc=True)
+    stop = pd.to_datetime(merged["STOP"], format=TIMESTAMP_FORMAT, utc=True)
+    birth = pd.to_datetime(merged["BIRTHDATE"], format=DATE_FORMAT, utc=True)
     death = _parse_death_dates(merged["DEATHDATE"])
 
     before_birthday = (stop.dt.month < birth.dt.month) | (

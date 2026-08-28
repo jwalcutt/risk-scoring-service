@@ -8,6 +8,7 @@ discharge date. Each rule gets fixture encounters exercising both sides
 of its boundary.
 """
 
+import warnings
 from pathlib import Path
 
 import pandas as pd
@@ -253,3 +254,108 @@ def test_load_cohort_reads_csv_directory(tmp_path: Path) -> None:
 def test_cohort_version_is_declared() -> None:
     assert isinstance(COHORT_VERSION, str)
     assert COHORT_VERSION
+
+
+# --- timestamp parsing ---
+
+# Encounter START/STOP are "%Y-%m-%dT%H:%M:%SZ" and patient
+# BIRTHDATE/DEATHDATE are "%Y-%m-%d" in the Synthea export. Parsing pins
+# those formats rather than letting pandas infer them, so a column that
+# stops conforming raises here instead of being reinterpreted by
+# dateutil under a different reading of the same digits.
+
+PARSE_FAILURE = r"doesn't match format|unconverted data remains"
+
+AMBIGUOUS_MINUTE_START = "2007-02-05T20:07:18Z"
+AMBIGUOUS_MINUTE_STOP = "2007-02-09T20:07:18Z"
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        ("START", "2024-03-01 10:30:00"),
+        ("START", "03/01/2024"),
+        ("STOP", "2024-03-05 16:00:00"),
+        ("STOP", "05/03/2024"),
+    ],
+)
+def test_non_conforming_encounter_timestamp_raises(column: str, value: str) -> None:
+    encounters = frame(
+        [
+            make_encounter_row(
+                Id="e1", PATIENT="p-adult", ENCOUNTERCLASS="inpatient", **{column: value}
+            )
+        ]
+    )
+    with pytest.raises(ValueError, match=PARSE_FAILURE):
+        build_cohort(encounters, frame([ADULT]))
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        ("BIRTHDATE", "1970-01-01T00:00:00Z"),
+        ("BIRTHDATE", "01/01/1970"),
+        ("DEATHDATE", "2024-03-03T00:00:00Z"),
+        ("DEATHDATE", "03/03/2024"),
+    ],
+)
+def test_non_conforming_patient_date_raises(column: str, value: str) -> None:
+    encounters = frame([make_encounter_row(Id="e1", PATIENT="p-adult", ENCOUNTERCLASS="inpatient")])
+    patient = make_patient_row(Id="p-adult", **{"BIRTHDATE": "1970-01-01", column: value})
+    with pytest.raises(ValueError, match=PARSE_FAILURE):
+        build_cohort(encounters, frame([patient]))
+
+
+def test_conforming_values_parse_to_the_declared_instants() -> None:
+    """A timestamp whose format pandas cannot infer still parses exactly."""
+    encounters = frame(
+        [
+            make_encounter_row(
+                Id="e1",
+                PATIENT="p-adult",
+                ENCOUNTERCLASS="inpatient",
+                START=AMBIGUOUS_MINUTE_START,
+                STOP=AMBIGUOUS_MINUTE_STOP,
+            )
+        ]
+    )
+    row = build_cohort(encounters, frame([ADULT])).frame.iloc[0]
+    assert row["start"] == pd.Timestamp(AMBIGUOUS_MINUTE_START)
+    assert row["stop"] == pd.Timestamp(AMBIGUOUS_MINUTE_STOP)
+    assert row["age_at_discharge"] == 37
+
+
+def test_parsing_never_falls_back_to_dateutil() -> None:
+    """No column is parsed element-by-element under a guessed format."""
+    encounters = frame(
+        [
+            make_encounter_row(
+                Id="e1",
+                PATIENT="p-adult",
+                ENCOUNTERCLASS="inpatient",
+                START=AMBIGUOUS_MINUTE_START,
+                STOP=AMBIGUOUS_MINUTE_STOP,
+            ),
+            make_encounter_row(
+                Id="e2",
+                PATIENT="p-deceased",
+                ENCOUNTERCLASS="inpatient",
+                START="2007-03-05T20:07:18Z",
+                STOP="2007-03-09T20:07:18Z",
+            ),
+        ]
+    )
+    deceased = make_patient_row(Id="p-deceased", BIRTHDATE="1960-05-04", DEATHDATE="2007-03-07")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        result = build_cohort(encounters, frame([ADULT, deceased]))
+    assert list(result.frame["encounter_id"]) == ["e1"]
+    assert result.exclusions.in_hospital_death == 1
+
+
+def test_empty_death_date_still_reads_as_missing() -> None:
+    encounters = frame([make_encounter_row(Id="e1", PATIENT="p-adult", ENCOUNTERCLASS="inpatient")])
+    result = build_cohort(encounters, frame([make_patient_row(Id="p-adult", DEATHDATE="")]))
+    assert list(result.frame["encounter_id"]) == ["e1"]
+    assert result.exclusions.in_hospital_death == 0

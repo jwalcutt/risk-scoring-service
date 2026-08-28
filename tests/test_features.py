@@ -29,6 +29,7 @@ these tests pin:
   cancer situation codes do not flag malignancy.
 """
 
+import warnings
 from datetime import datetime, timedelta
 
 import pandas as pd
@@ -523,3 +524,117 @@ def test_history_of_other_patients_is_ignored() -> None:
     assert row["active_disorder_count"] == 0
     assert row["flag_diabetes"] == 0
     assert row["days_since_prev_discharge"] == 365.0
+
+
+# --- timestamp parsing ---
+
+# The Synthea export writes encounter and medication timestamps as
+# "%Y-%m-%dT%H:%M:%SZ" and condition dates as "%Y-%m-%d". Parsing pins
+# those formats rather than letting pandas infer them, so a column that
+# stops conforming raises here instead of being reinterpreted by
+# dateutil under a different reading of the same digits.
+
+PARSE_FAILURE = r"doesn't match format|unconverted data remains"
+
+AMBIGUOUS_MINUTE_TIMESTAMP = "2007-02-09T20:07:18Z"
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        ("START", "2024-06-01 08:00:00"),
+        ("START", "06/01/2024"),
+        ("STOP", "2024-06-08 08:00:00"),
+        ("STOP", "08/06/2024"),
+    ],
+)
+def test_non_conforming_medication_timestamp_raises(column: str, value: str) -> None:
+    with pytest.raises(ValueError, match=PARSE_FAILURE):
+        single(medications=[make_medication_row(PATIENT="p1", **{column: value})])
+
+
+@pytest.mark.parametrize("value", ["2024-05-22 08:00:00", "05/22/2024"])
+def test_non_conforming_encounter_stop_raises(value: str) -> None:
+    with pytest.raises(ValueError, match=PARSE_FAILURE):
+        single(encounters=[prior_stay(stop=value, start="2024-05-20T08:00:00Z")])
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        ("START", "2020-01-01T00:00:00Z"),
+        ("START", "01/01/2020"),
+        ("STOP", "2024-05-01T00:00:00Z"),
+        ("STOP", "05/01/2024"),
+    ],
+)
+def test_non_conforming_condition_date_raises(column: str, value: str) -> None:
+    with pytest.raises(ValueError, match=PARSE_FAILURE):
+        single(conditions=[make_condition_row(PATIENT="p1", **{column: value})])
+
+
+def test_conforming_values_parse_to_the_declared_instants() -> None:
+    """A timestamp whose format pandas cannot infer still parses exactly."""
+    stop = AMBIGUOUS_MINUTE_TIMESTAMP
+    start = "2007-02-05T20:07:18Z"
+    row = single(
+        start=start,
+        stop=stop,
+        encounters=[prior_stay(stop="2007-01-06T20:07:18Z")],
+        medications=[
+            make_medication_row(PATIENT="p1", START="2007-01-10T20:07:18Z", STOP=""),
+            make_medication_row(PATIENT="p1", START="2007-01-11T20:07:18Z", STOP=stop),
+        ],
+        conditions=[
+            make_condition_row(
+                PATIENT="p1",
+                START="2007-01-02",
+                STOP="",
+                CODE="44054006",
+                DESCRIPTION="Diabetes mellitus type 2 (disorder)",
+            )
+        ],
+    )
+    assert row["los_days"] == 4.0
+    assert row["prior_inpatient_180d"] == 1
+    assert row["days_since_prev_discharge"] == 30.0
+    assert row["active_medication_count"] == 1
+    assert row["active_disorder_count"] == 1
+    assert row["flag_diabetes"] == 1
+
+
+def test_parsing_never_falls_back_to_dateutil() -> None:
+    """No column is parsed element-by-element under a guessed format."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        row = single(
+            start="2007-02-05T20:07:18Z",
+            stop=AMBIGUOUS_MINUTE_TIMESTAMP,
+            encounters=[
+                prior_stay(stop="2007-01-06T20:07:18Z", encounter_id="e-prior-1"),
+                prior_stay(stop="2007-01-16T20:07:18Z", encounter_id="e-prior-2"),
+            ],
+            medications=[
+                make_medication_row(
+                    PATIENT="p1", START="2007-01-10T20:07:18Z", STOP="2007-01-20T20:07:18Z"
+                ),
+                make_medication_row(
+                    PATIENT="p1", START="2007-01-11T20:07:18Z", STOP="2007-03-21T20:07:18Z"
+                ),
+            ],
+            conditions=[
+                make_condition_row(PATIENT="p1", START="2007-01-02", STOP=""),
+                make_condition_row(PATIENT="p1", START="2007-01-03", STOP="2007-01-20"),
+            ],
+        )
+    assert row["prior_inpatient_180d"] == 2
+    assert row["active_medication_count"] == 1
+
+
+def test_empty_optional_timestamps_still_read_as_missing() -> None:
+    row = single(
+        medications=[make_medication_row(PATIENT="p1", START="2024-05-01T08:00:00Z", STOP="")],
+        conditions=[make_condition_row(PATIENT="p1", START="2020-01-01", STOP="")],
+    )
+    assert row["active_medication_count"] == 1
+    assert row["active_disorder_count"] == 1

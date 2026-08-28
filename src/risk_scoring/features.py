@@ -44,6 +44,14 @@ Judgment calls this module fixes:
   ICD10 code starting with "C" is malignant by that system's structure;
   renal disease is chronic kidney disease only, excluding acute
   postoperative renal failure.
+- Timestamp columns are parsed under the exact formats the Synthea
+  export writes: encounter and medication timestamps as
+  ``%Y-%m-%dT%H:%M:%SZ``, condition dates as ``%Y-%m-%d``. Pandas would
+  otherwise guess a format from the first element and fall back to
+  per-element dateutil parsing when the guess fails, which is how the
+  same digits get read two ways. A non-conforming value raises here
+  instead, matching the formats ``risk_scoring.state`` already enforces
+  when an event is constructed.
 - Patient-level lifetime aggregates (HEALTHCARE_EXPENSES,
   HEALTHCARE_COVERAGE, INCOME) and DEATHDATE are never features: all
   four encode information from beyond the scoring instant.
@@ -55,6 +63,10 @@ import numpy as np
 import pandas as pd
 
 FEATURE_VERSION = "1.0.0"
+
+TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
+DATE_FORMAT = "%Y-%m-%d"
 
 DAYS_SINCE_PREV_DISCHARGE_CAP = 365.0
 
@@ -119,9 +131,9 @@ FLAG_CODES: dict[str, frozenset[str]] = {
 }
 
 
-def _parse_optional_timestamps(raw: pd.Series, utc: bool) -> pd.Series:
+def _parse_optional_timestamps(raw: pd.Series, fmt: str, utc: bool) -> pd.Series:
     cleaned = raw.fillna("").astype(str)
-    return pd.to_datetime(cleaned.where(cleaned != "", None), utc=utc)
+    return pd.to_datetime(cleaned.where(cleaned != "", None), format=fmt, utc=utc)
 
 
 def _counts_for(mask: pd.Series, encounter_ids: pd.Series, index: pd.Index) -> pd.Series:
@@ -136,8 +148,12 @@ def build_features(
 ) -> pd.DataFrame:
     """Compute one feature row per cohort row, as of that row's discharge."""
     out = cohort.loc[:, ["encounter_id", "patient_id", "age_at_discharge"]].reset_index(drop=True)
-    score_start = pd.to_datetime(cohort["start"], utc=True).reset_index(drop=True)
-    score_stop = pd.to_datetime(cohort["stop"], utc=True).reset_index(drop=True)
+    score_start = pd.to_datetime(cohort["start"], format=TIMESTAMP_FORMAT, utc=True).reset_index(
+        drop=True
+    )
+    score_stop = pd.to_datetime(cohort["stop"], format=TIMESTAMP_FORMAT, utc=True).reset_index(
+        drop=True
+    )
     score_date = score_stop.dt.tz_localize(None).dt.normalize()
     out["los_days"] = (score_stop - score_start).dt.total_seconds() / 86400.0
 
@@ -157,7 +173,9 @@ def build_features(
             "Id": encounters["Id"],
             "patient_id": encounters["PATIENT"],
             "encounter_class": encounters["ENCOUNTERCLASS"],
-            "prior_stop": _parse_optional_timestamps(encounters["STOP"], utc=True),
+            "prior_stop": _parse_optional_timestamps(
+                encounters["STOP"], TIMESTAMP_FORMAT, utc=True
+            ),
         }
     )
     joined = anchor.merge(enc, on="patient_id", how="inner")
@@ -194,8 +212,8 @@ def build_features(
     med = pd.DataFrame(
         {
             "patient_id": medications["PATIENT"],
-            "med_start": pd.to_datetime(medications["START"], utc=True),
-            "med_stop": _parse_optional_timestamps(medications["STOP"], utc=True),
+            "med_start": pd.to_datetime(medications["START"], format=TIMESTAMP_FORMAT, utc=True),
+            "med_stop": _parse_optional_timestamps(medications["STOP"], TIMESTAMP_FORMAT, utc=True),
         }
     )
     joined_med = anchor.merge(med, on="patient_id", how="inner")
@@ -209,8 +227,8 @@ def build_features(
     cond = pd.DataFrame(
         {
             "patient_id": conditions["PATIENT"],
-            "cond_start": pd.to_datetime(conditions["START"]),
-            "cond_stop": _parse_optional_timestamps(conditions["STOP"], utc=False),
+            "cond_start": pd.to_datetime(conditions["START"], format=DATE_FORMAT),
+            "cond_stop": _parse_optional_timestamps(conditions["STOP"], DATE_FORMAT, utc=False),
             "system": conditions["SYSTEM"],
             "code": conditions["CODE"].astype(str),
             "description": conditions["DESCRIPTION"].astype(str),
