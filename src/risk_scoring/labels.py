@@ -22,6 +22,13 @@ Judgment calls this module fixes:
   model predicts readmission, not death; the competing risk is accepted
   and recorded here rather than modeled, and the module never reads
   patient records.
+- Candidate starts are parsed under ``%Y-%m-%dT%H:%M:%SZ``, the exact
+  format the Synthea export writes. Pandas would otherwise guess a
+  format from the first element and fall back to per-element dateutil
+  parsing when the guess fails, so whether a malformed value is rejected
+  or quietly reinterpreted would depend on the first row. A start read
+  under a different reading of the same digits moves an encounter across
+  the 30-day boundary, flipping a label.
 - This module is the only source of training labels. The crude rate in
   ``risk_scoring.datagen.sanity`` is a data-adequacy check and
   deliberately shares no code with it.
@@ -33,6 +40,8 @@ import numpy as np
 import pandas as pd
 
 LABEL_VERSION = "1.0.0"
+
+TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 READMISSION_WINDOW_DAYS = 30
 
@@ -52,7 +61,9 @@ def build_labels(cohort: pd.DataFrame, encounters: pd.DataFrame) -> pd.DataFrame
         {
             "candidate_id": inpatient["Id"],
             "patient_id": inpatient["PATIENT"],
-            "candidate_start": pd.to_datetime(inpatient["START"], utc=True),
+            "candidate_start": pd.to_datetime(
+                inpatient["START"], format=TIMESTAMP_FORMAT, utc=True
+            ),
         }
     )
 

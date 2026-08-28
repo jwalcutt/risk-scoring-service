@@ -17,7 +17,10 @@ raw encounters frame. The rules these tests pin:
 - Output is one row per cohort row, in cohort order, with integer labels.
 """
 
+import warnings
+
 import pandas as pd
+import pytest
 
 from factories import ENCOUNTER_DEFAULTS, make_encounter_row
 from risk_scoring.labels import LABEL_COLUMNS, LABEL_VERSION, build_labels
@@ -203,3 +206,66 @@ def test_labels_align_one_row_per_cohort_row_in_cohort_order() -> None:
     assert list(result["encounter_id"]) == ["e-a", "e-b", "e-c"]
     # Stay B is both A's readmission and its own index row with no later stay.
     assert list(result["label"]) == [1, 0, 0]
+
+
+# --- timestamp parsing ---
+
+# Candidate readmission starts are parsed under the exact format the
+# Synthea export writes, "%Y-%m-%dT%H:%M:%SZ". Letting pandas infer the
+# format lets a malformed value be reinterpreted by dateutil rather than
+# rejected, and a start read a day early or late moves an encounter
+# across the 30-day boundary.
+
+PARSE_FAILURE = r"doesn't match format|unconverted data remains"
+
+AMBIGUOUS_MINUTE_START = "2007-02-05T20:07:18Z"
+
+AMBIGUOUS_MINUTE_STOP = "2007-02-09T20:07:18Z"
+
+
+def ambiguous_index() -> tuple[list[dict[str, object]], dict[str, str]]:
+    """A cohort row and index encounter whose start defeats pandas' format guess.
+
+    Without an explicit format the guess fails on this first element, so
+    the whole column reaches dateutil, which accepts values that a
+    successful guess would have rejected.
+    """
+    index_encounter = make_encounter_row(
+        Id="e-score",
+        PATIENT="p1",
+        ENCOUNTERCLASS="inpatient",
+        START=AMBIGUOUS_MINUTE_START,
+        STOP=AMBIGUOUS_MINUTE_STOP,
+    )
+    cohort_rows = [make_cohort_row(start=AMBIGUOUS_MINUTE_START, stop=AMBIGUOUS_MINUTE_STOP)]
+    return cohort_rows, index_encounter
+
+
+@pytest.mark.parametrize("value", ["2007-03-11 20:07:18", "03/11/2007"])
+def test_non_conforming_candidate_start_raises(value: str) -> None:
+    cohort_rows, index_encounter = ambiguous_index()
+    bad = later_stay(start=value, stop="2007-03-13T20:07:18Z")
+    with pytest.raises(ValueError, match=PARSE_FAILURE):
+        labels_for(cohort_rows, [index_encounter, bad])
+
+
+def test_conforming_values_label_across_the_window_boundary() -> None:
+    """Timestamps whose format pandas cannot infer still place the boundary exactly."""
+    cohort_rows, index_encounter = ambiguous_index()
+
+    on_edge = later_stay(start="2007-03-11T20:07:18Z", stop="2007-03-13T20:07:18Z")
+    assert list(labels_for(cohort_rows, [index_encounter, on_edge])["label"]) == [1]
+
+    past_edge = later_stay(start="2007-03-11T20:07:19Z", stop="2007-03-13T20:07:18Z")
+    assert list(labels_for(cohort_rows, [index_encounter, past_edge])["label"]) == [0]
+
+
+def test_parsing_never_falls_back_to_dateutil() -> None:
+    """The candidate start column is not parsed element-by-element under a guess."""
+    cohort_rows, index_encounter = ambiguous_index()
+    later = later_stay(start="2007-02-20T20:07:18Z", stop="2007-02-23T20:07:18Z")
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        result = labels_for(cohort_rows, [index_encounter, later])
+    assert list(result["label"]) == [1]
