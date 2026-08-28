@@ -251,4 +251,44 @@ The worked example traces the target discharge, encounter `31576c3d-e3a7-4eef-65
 - Loading `models:/readmission-risk/3` from MLflow and re-scoring the logged feature values reproduced the logged score exactly, to the last bit, with no tolerance.
 - The stored features are `age_at_discharge` 63, `los_days` 1, `prior_inpatient_180d` 0, `days_since_prev_discharge` 365 (the no-history sentinel), `prior_ed_180d` 1, `active_medication_count` 7, `active_disorder_count` 11, and the diabetes, MI, and renal flags set.
 
-Two properties were checked alongside it. Re-posting the same discharge answered 202 with `scored: false` and left the table at three rows. Running the batch pipeline over the same rows produced the same three cohort discharges, and every one of the 42 logged feature values matched its batch value exactly.
+Two properties were checked alongside it. Re-posting the same discharge answered 202 with `scored: false` and left the table at three rows. Running the batch pipeline over the same rows produced the same three cohort discharges, and every one of the 42 logged feature values matched its batch value exactly. That trace was performed by hand on one encounter; the sections below turn the same two recomputations into code that runs over every prediction a batch produces.
+
+## Recomputing provenance
+
+A logged prediction makes two claims, and both are checkable after the fact. Its input hash covers the exact event that produced it, and its score is what the named model version returns for the stored feature values. `risk_scoring/provenance.py` recomputes both rather than trusting the row.
+
+The source event is rebuilt from the population export, never from whatever the caller holds in memory. Hashing the same object twice inside one process would prove nothing. Rebuilding it proves the whole chain: source CSV row, payload projection, posted envelope, stored digest. The envelope is the part worth naming, because the service hashes the whole posted body rather than the payload inside it, and a recomputation over the payload alone would disagree with every row ever written.
+
+The model comes from the version the row itself names, never the version the service happens to be pinned to. That is the failure the check exists to catch, since a row written by an entirely different model would otherwise pass without comment.
+
+Comparison is exact and carries no tolerance. The score column is `double precision` and the feature values are `jsonb`, so both round-trip losslessly, and two loads of one artifact deserialize the same booster. The mistakes worth catching here, a wrong column order or a rounded stored value or the wrong version, either move the score visibly or not at all, so a tolerance would only widen the band where something subtly wrong looks fine. A mismatch reports both values with their absolute and last-bit difference, so a run on different hardware would be diagnosable rather than merely failed.
+
+`tests/test_provenance_postgres.py` runs the same recomputation in CI over a synthetic population. It trains on the signal-bearing population rather than the small fixture the other service tests share. That fixture trains on 46 rows and produces a constant predictor, returning the base rate for every input, so the score half of every assertion would have held no matter what the re-score returned.
+
+## The held-out batch
+
+`python -m risk_scoring.scoring_run run` posts encounters the model was never trained on. Held out means discharged at or after the 2025-01-01 training cutoff, which is the exact complement of the training window, computed by one function in the cohort module so the two halves cannot drift apart at the boundary.
+
+Selection works on patients, not encounters, and that distinction carries the run. A patient's features read their whole history, so posting only their post-cutoff rows would make serving features disagree with the training pipeline for a reason that is not a defect in either. Every selected patient is posted in full, back to their earliest row. The consequence is that the service also scores their pre-cutoff discharges, which the model was trained through, and those are reported as their own count and their own distribution. Summing the two would present in-sample discharges as held-out evidence.
+
+The run reads its log back filtered to the encounters it posted, so the summary describes that batch whatever else the database holds. It fails, naming encounter ids, when a discharge the cohort rules admit was never scored, when a logged row the cohort rules exclude appears anyway, or when what the service returned at the time disagrees with what it durably wrote.
+
+## Held-out batch scored against the containers
+
+Recorded 2026-08-28. The frozen populations are local-only, so this cannot run in CI:
+
+```bash
+python -m risk_scoring.scoring_run run --population baseline --patients 250
+```
+
+A seeded sample of 250 patients drawn from the 639 in the frozen baseline holding a post-cutoff cohort discharge, posted to the Compose stack over HTTP one event at a time: 250 demographics events, 25,101 encounters, 19,958 medications, and 12,611 conditions, 57,920 events in all. The service admitted and scored 326 held-out discharges and 409 pre-cutoff discharges of the same patients, 735 predictions in total, with no cohort discharge left unscored and no logged row the cohort rules exclude. Every acknowledgement the service returned matched the row it durably wrote. Runtime 179 seconds. `GET /version` reported model `readmission-risk` version 3, `FEATURE_VERSION` 1.0.0, `COHORT_VERSION` 1.0.0, and the serving commit's SHA.
+
+Held-out scores span 0.000155 to 0.788526, with median 0.017349, quartiles 0.006704 and 0.062074, fifth and ninety-fifth percentiles 0.000537 and 0.362723, and mean 0.071047. Across all 735 predictions the median is 0.014145 and the mean 0.069563. The pre-cutoff figures are recorded for completeness and are not evidence of held-out performance.
+
+All 735 predictions reproduced. The worked example is the held-out prediction at the median score, encounter `7609e8c3-fbdc-cb44-d2ba-6cff1456f1a1` for patient `7609e8c3-fbdc-cb44-6ebb-a555935aa5c4`, discharged 2026-01-08T15:46:48Z and logged as prediction 598 with score 0.01740727240699904:
+
+- Rebuilding the posted event from the source CSV row and taking SHA-256 over it reproduced the logged `input_hash` `68bf989f14fe55c4f3a5c5c85165efe88b579022fa91af88b5a5660d487b0f09`.
+- Loading `models:/readmission-risk/3` and re-scoring the logged feature values reproduced the logged score exactly, to the last bit, with no tolerance.
+- The stored features are `age_at_discharge` 59, `los_days` 7.345879629629629, `prior_inpatient_180d` 0, `days_since_prev_discharge` 365 (the no-history sentinel), `prior_ed_180d` 0, `active_medication_count` 7, `active_disorder_count` 10, and the diabetes, malignancy, and renal flags set.
+
+Running the same command a second time against the same database logged nothing new and still reported 735 predictions reproduced, since a discharge already carrying a prediction is not scored again.

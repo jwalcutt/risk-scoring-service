@@ -86,7 +86,15 @@ Every score is written with the provenance needed to reconstruct it later: the p
 
 A discharge has exactly one score, enforced by the database rather than by convention, so replaying a stream cannot duplicate history or rewrite it. That uniqueness is also what makes an interrupted run safe to resume: whether a discharge still needs scoring is decided by whether the log holds it, not by whether the event was new, so an event that was stored while its score was not gets scored when the stream replays it.
 
-A worked trace against generated data, from a logged row back through its input hash and model version to an exact re-score, is recorded in [docs/service-notes.md](docs/service-notes.md).
+That claim is checkable rather than asserted. `risk_scoring.provenance` takes a logged row back apart: it rebuilds the posted event from the source data and recomputes its hash, then loads the model version the row itself names and re-scores the feature values the row stored. Both must match exactly, with no tolerance. Loading the version the service is currently pinned to instead of the one the row names would let a prediction from an entirely different model pass, so the check deliberately does not. A test runs it in CI over every prediction a synthetic population produces.
+
+## Scoring a held-out batch
+
+`python -m risk_scoring.scoring_run run` posts encounters the model was never trained on, drawn from discharges after the training cutoff, and verifies what the service made of them.
+
+It selects patients rather than encounters, which matters more than it sounds. A patient's features read their whole history, so a patient chosen for a recent discharge is posted in full, back to their earliest record. The service therefore also scores their older discharges, which the model was trained through, and the run reports those as a separate count with their own score distribution. Collapsing the two into one number would present in-sample discharges as held-out evidence.
+
+The run reads its own predictions back and recomputes the provenance of every one. It fails, naming encounter ids, if a discharge the cohort rules admit went unscored, if a row the cohort rules exclude was logged anyway, or if what the service answered at the time disagrees with what it wrote. Against the container stack, a 250-patient sample posted 57,920 events and scored 735 discharges, 326 of them held out, with all 735 predictions reproduced from source and model; [docs/service-notes.md](docs/service-notes.md) records the run and a worked example.
 
 ## Restarting without losing anything
 
@@ -128,4 +136,4 @@ That command goes from raw generator output to a registered model version, gates
 
 Early in development. The data spine exists (frozen synthetic populations plus verification tooling), the cohort, feature, and label layers are implemented and tested, and a single command retrains from raw generator output into a registered model version and a gate report, with results recorded in [docs/training-notes.md](docs/training-notes.md) and [docs/gate-notes.md](docs/gate-notes.md).
 
-The service now runs as a container stack: it ingests events over HTTP into Postgres-backed per-patient state, scores admitted discharges through the same feature module the training pipeline uses, and logs every prediction with full provenance. Training-serving agreement is asserted in CI and confirmed against generated data, and so is restart equivalence. What does not exist yet is the replay harness that drives the stream on a simulated clock, so events are posted by scripted batches rather than streamed, and no monitoring or retraining loop reads the prediction log yet.
+The service now runs as a container stack: it ingests events over HTTP into Postgres-backed per-patient state, scores admitted discharges through the same feature module the training pipeline uses, and logs every prediction with full provenance. Training-serving agreement is asserted in CI and confirmed against generated data, and so are restart equivalence and provenance re-verification. A batch of held-out encounters has been scored end to end against the container stack, with every logged prediction traced back to its source event and its registered model. What does not exist yet is the replay harness that drives the stream on a simulated clock, so events are posted by scripted batches rather than streamed, and no monitoring or retraining loop reads the prediction log yet.
