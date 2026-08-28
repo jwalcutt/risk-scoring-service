@@ -372,3 +372,130 @@ def payload_frame(rows: Iterable[Mapping[str, str]], columns: Sequence[str]) -> 
     return pd.DataFrame(
         [{name: row[name] for name in columns} for row in rows], columns=list(columns)
     )
+
+
+def write_skew_population(csv_dir: Path) -> int:
+    """Population built to exercise every feature boundary at once.
+
+    Eight patients cover the cases the batch feature tests pin
+    individually: the 180-day window's inclusive far edge and the day
+    beyond it, the days-since-previous cap and its no-history sentinel,
+    overlapping stays flooring the gap at zero, a readmission whose
+    features must see the index stay, medications stopping exactly at the
+    discharge instant, conditions starting and stopping on the discharge
+    date, a finding that is not a disorder, two prescriptions of one drug
+    sharing an encounter and a start instant, history-based flags from a
+    resolved situation code and from an ICD10 malignancy, and events
+    dated after the discharge that no feature may read. Three patients
+    are excluded outright: a minor, an in-hospital death, and one with no
+    inpatient encounter.
+
+    Returns the number of encounters the cohort rules admit.
+    """
+    patients = [
+        make_patient_row(Id="p-fresh", BIRTHDATE="1970-05-15"),
+        make_patient_row(Id="p-edge", BIRTHDATE="1955-02-20"),
+        make_patient_row(Id="p-gap", BIRTHDATE="1948-11-03"),
+        make_patient_row(Id="p-readmit", BIRTHDATE="1962-07-07"),
+        make_patient_row(Id="p-full", BIRTHDATE="1951-09-30"),
+        make_patient_row(Id="p-minor", BIRTHDATE="2008-06-01"),
+        make_patient_row(Id="p-died", BIRTHDATE="1940-01-01", DEATHDATE="2024-03-12"),
+        make_patient_row(Id="p-outpatient", BIRTHDATE="1975-01-01"),
+    ]
+
+    def stay(
+        encounter_id: str, patient: str, start: str, stop: str, encounter_class: str = "inpatient"
+    ) -> dict[str, str]:
+        return make_encounter_row(
+            Id=encounter_id,
+            PATIENT=patient,
+            ENCOUNTERCLASS=encounter_class,
+            START=start,
+            STOP=stop,
+        )
+
+    encounters = [
+        # No history at all: the days-since-previous sentinel and zero counts.
+        stay("e-fresh", "p-fresh", "2024-03-01T09:00:00Z", "2024-03-04T09:00:00Z"),
+        # The index discharge's 180-day window opens 2023-12-17T07:00:00Z.
+        stay("e-edge-out", "p-edge", "2023-12-16T03:00:00Z", "2023-12-16T07:00:00Z", "emergency"),
+        stay("e-edge-in", "p-edge", "2023-12-17T01:00:00Z", "2023-12-17T07:00:00Z"),
+        stay("e-edge-ed", "p-edge", "2024-01-05T10:00:00Z", "2024-01-05T13:00:00Z", "emergency"),
+        stay("e-edge-index", "p-edge", "2024-06-10T07:00:00Z", "2024-06-14T07:00:00Z"),
+        # A discharge far enough back to hit the cap, then two overlapping stays.
+        stay("e-gap-ancient", "p-gap", "2022-01-05T08:00:00Z", "2022-01-10T08:00:00Z"),
+        stay("e-gap-index", "p-gap", "2024-02-01T08:00:00Z", "2024-02-05T08:00:00Z"),
+        stay("e-gap-overlap-a", "p-gap", "2024-04-01T08:00:00Z", "2024-04-10T08:00:00Z"),
+        stay("e-gap-overlap-b", "p-gap", "2024-04-05T08:00:00Z", "2024-04-12T08:00:00Z"),
+        # A readmission ten days after its index discharge; both are scored.
+        stay("e-readmit-1", "p-readmit", "2024-05-01T08:00:00Z", "2024-05-05T08:00:00Z"),
+        stay("e-readmit-2", "p-readmit", "2024-05-15T08:00:00Z", "2024-05-18T08:00:00Z"),
+        # The medication and condition boundaries all land on this discharge.
+        stay("e-full-index", "p-full", "2024-08-01T06:00:00Z", "2024-08-05T06:00:00Z"),
+        stay("e-minor", "p-minor", "2024-01-02T08:00:00Z", "2024-01-05T08:00:00Z"),
+        stay("e-died", "p-died", "2024-03-08T08:00:00Z", "2024-03-12T08:00:00Z"),
+        stay(
+            "e-out-wellness",
+            "p-outpatient",
+            "2024-02-02T08:00:00Z",
+            "2024-02-02T09:00:00Z",
+            "wellness",
+        ),
+        stay(
+            "e-out-ed", "p-outpatient", "2024-02-20T08:00:00Z", "2024-02-20T11:00:00Z", "emergency"
+        ),
+    ]
+
+    def prescription(code: str, start: str, stop: str) -> dict[str, str]:
+        return make_medication_row(
+            PATIENT="p-full", ENCOUNTER="e-full-index", CODE=code, START=start, STOP=stop
+        )
+
+    medications = [
+        # Stopping exactly at the discharge instant means inactive.
+        prescription("308136", "2024-07-01T06:00:00Z", "2024-08-05T06:00:00Z"),
+        prescription("310798", "2024-07-02T06:00:00Z", ""),
+        # Same drug, encounter, and instant as the row above, differing only in
+        # stop: a single dispense beside a continuing course, which is how
+        # Synthea records a renewal. Both are active and both must be counted.
+        prescription("310798", "2024-07-02T06:00:00Z", "2024-09-15T06:00:00Z"),
+        prescription("314076", "2024-07-03T06:00:00Z", "2024-09-01T06:00:00Z"),
+        prescription("861007", "2024-06-01T06:00:00Z", "2024-07-15T06:00:00Z"),
+        # Prescribed the day after discharge: invisible to the scored row.
+        prescription("197361", "2024-08-06T06:00:00Z", ""),
+    ]
+
+    def diagnosis(
+        code: str, start: str, stop: str, description: str, system: str = "SNOMED-CT"
+    ) -> dict[str, str]:
+        return make_condition_row(
+            PATIENT="p-full",
+            ENCOUNTER="e-full-index",
+            SYSTEM=system,
+            CODE=code,
+            START=start,
+            STOP=stop,
+            DESCRIPTION=description,
+        )
+
+    conditions = [
+        diagnosis("444814009", "2024-01-10", "", "Viral sinusitis (disorder)"),
+        # Recorded on the discharge date: active. Resolved on it: not active.
+        diagnosis("195662009", "2024-08-05", "", "Acute viral pharyngitis (disorder)"),
+        diagnosis("10509002", "2024-02-01", "2024-08-05", "Acute bronchitis (disorder)"),
+        diagnosis("160903007", "2024-03-01", "", "Full-time employment (finding)"),
+        diagnosis("39848009", "2024-08-06", "", "Whiplash injury to neck (disorder)"),
+        diagnosis("88805009", "2023-05-01", "", "Chronic congestive heart failure (disorder)"),
+        # Resolved situation code: sets the history-based flag, counts as no disorder.
+        diagnosis(
+            "399211009", "2020-01-01", "2020-02-01", "History of myocardial infarction (situation)"
+        ),
+        diagnosis("C50.9", "2022-06-01", "", "Malignant neoplasm of breast (disorder)", "ICD10"),
+    ]
+
+    csv_dir.mkdir(parents=True, exist_ok=True)
+    write_rows_csv(csv_dir / "patients.csv", patients)
+    write_rows_csv(csv_dir / "encounters.csv", encounters)
+    write_rows_csv(csv_dir / "medications.csv", medications)
+    write_rows_csv(csv_dir / "conditions.csv", conditions)
+    return 10
