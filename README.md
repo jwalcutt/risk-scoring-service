@@ -42,6 +42,18 @@ Scoring targets adult inpatient discharges. The cohort module (`risk_scoring.coh
 
 The feature module (`risk_scoring.features`) computes one row per discharge, as of the discharge timestamp. The features are age, length of stay, inpatient and emergency visit counts over the prior 180 days, days since the previous discharge capped at 365, active medication and chronic condition counts, and seven comorbidity flags (heart failure, chronic pulmonary disease, dementia, diabetes, malignancy, myocardial infarction, chronic kidney disease) from curated code lists. No feature reads anything recorded after the scoring discharge, and the module docstring records each point-in-time rule. The same module serves both training and live scoring, and `FEATURE_VERSION` is logged with every prediction so scores are traceable to the feature definitions that produced them.
 
+## Per-patient state and the skew check
+
+Live scoring needs each patient's history available at the moment a discharge arrives. The service keeps that history as raw events rather than running totals: four Postgres tables hold exactly the generator columns the cohort and feature modules read, storing every value as the verbatim string it arrived as. Ingestion is idempotent, keyed on identifiers derived from the payload itself, so a retried or replayed event never duplicates state, and an event that arrives with the same key but different values is rejected loudly instead of overwritten.
+
+Recomputing from raw history is what lets serving call the shared modules rather than a serving-shaped copy of them. Scoring one discharge reads that patient's history back as frames identical to a CSV load and passes them to the same `build_cohort` and `build_features` the training pipeline runs, so a discharge the cohort rules reject updates state and produces no score.
+
+A test in CI asserts that the two paths agree. It builds a population that lands on every feature boundary at once, runs the batch pipeline over it, then interleaves the same rows into one timestamp-ordered stream, ingests them one event at a time, and scores each discharge from persisted state alone. The two sets of feature values must be exactly equal, not equal within a tolerance. The same comparison run against generated data matched on every feature of all 1,202 discharges in a 500-patient sample, and [docs/service-notes.md](docs/service-notes.md) records the storage decisions, the arrival-time rules, and that run.
+
+```bash
+docker compose up -d postgres && python -m risk_scoring.db migrate
+```
+
 ## Labels and training
 
 The label module (`risk_scoring.labels`) marks a discharge as a readmission when the same patient starts another inpatient stay within 30 days of leaving, judged on the raw encounter stream. A stay that begins at or before the index discharge ends counts as a continuation of the same episode, not a readmission, and the module docstring records the boundary rules alongside its `LABEL_VERSION`.
@@ -74,4 +86,4 @@ That command goes from raw generator output to a registered model version, gates
 
 ## Current Status
 
-Early in development. The data spine exists (frozen synthetic populations plus verification tooling), the cohort, feature, and label layers are implemented and tested, and a single command retrains from raw generator output into a registered model version and a gate report, with results recorded in [docs/training-notes.md](docs/training-notes.md) and [docs/gate-notes.md](docs/gate-notes.md). The repository does not yet contain a runnable service; setup and replay instructions will be added to this README once the infrastructure falls into place.
+Early in development. The data spine exists (frozen synthetic populations plus verification tooling), the cohort, feature, and label layers are implemented and tested, and a single command retrains from raw generator output into a registered model version and a gate report, with results recorded in [docs/training-notes.md](docs/training-notes.md) and [docs/gate-notes.md](docs/gate-notes.md). Postgres-backed per-patient state and the serving-time feature path now exist behind that, with training-serving agreement asserted in CI and confirmed against generated data. The repository does not yet contain a runnable service; setup and replay instructions will be added to this README once the HTTP layer lands.
