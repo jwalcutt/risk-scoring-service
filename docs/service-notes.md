@@ -86,25 +86,78 @@ Pandas emits one `UserWarning` per run about falling back from datetime format i
 python -m risk_scoring.service run
 ```
 
-The command reads `configs/service.toml` from the working directory, loads the pinned model version from the repo-local MLflow registry, and serves on port 8000 (`--port` overrides it). Startup fails with a nonzero exit if the pinned version is absent from the registry; the service never starts without its model.
+The command reads `configs/service.toml` from the working directory, loads the pinned model version from the repo-local MLflow registry, opens a connection pool against `RISK_SCORING_DATABASE_URL` (defaulting to the Compose instance), and serves on port 8000 (`--port` overrides it). Startup fails with a nonzero exit if the pinned version is absent from the registry or the database is unreachable; the service never starts without either.
 
 ## Endpoints
 
 | Endpoint | Behavior |
 | --- | --- |
-| `GET /health` | `{"status": "ok"}`. A 200 implies startup completed, so the model is loaded. |
+| `GET /health` | `{"status": "ok"}`. A 200 implies startup completed, so the model is loaded and the database is reachable. |
 | `GET /version` | Model name and pinned version from the config, `FEATURE_VERSION`, `COHORT_VERSION`, and the git SHA (null when unresolvable). |
-| `POST /events` | Validates one event and answers 202 with the event type and the input hash. |
+| `POST /events` | Ingests one event and answers 202 with the event type, the input hash, whether the event was scored, and the prediction id and score when it was. |
 
 The git SHA comes from `git rev-parse HEAD` at startup and is null when the working directory is not a repository. The container image will not contain `.git`, so a build-time override must be added when the image exists.
 
 ## The HTTP ingestion boundary
 
-Events arrive over one endpoint, in timestamp order, one at a time, wrapped in an envelope that names the type: `{"event_type": "encounter", "payload": {...}}`. The four accepted types and their payload columns are the four `risk_scoring.state` events, carrying the same Synthea column names and the same verbatim-string rule; the wire format restates none of those field rules and the request models exist to reject a malformed body before it reaches the state layer.
+Events arrive over one endpoint, in timestamp order, one at a time, wrapped in an envelope that names the type: `{"event_type": "encounter", "payload": {...}}`. The four accepted types and their payload columns are the four `risk_scoring.state` events, carrying the same Synthea column names and the same verbatim-string rule.
 
-A payload that fails validation gets FastAPI's 422 with field-level detail, which is the contract's reject-with-4xx: unknown event types, unknown fields, missing fields, and values that fail their exact format are all rejected loudly, and nothing is dropped silently. Accepted events answer 202 rather than 200, which stays honest both now, while the handler acknowledges without writing, and later, when an accepted event that is not a cohort discharge updates state without producing a score. The acknowledgment carries the input hash, giving batch drivers a provenance handle before the predictions log exists.
+The split between the two layers is deliberate and narrow. The request models own shape: which fields exist, that no unknown field sneaks in, and which event type an envelope names. `state` owns every value rule: required-and-non-empty, the exact timestamp and date formats, and which fields may be empty. Both layers were built in parallel and independently arrived at the same four column sets and the same format checks, which is exactly the kind of duplication that drifts, so the format rules now live once and a test asserts each payload's field set equals the matching column tuple in `state`.
 
-The handler writes no state yet, and it keeps nothing in memory either: everything the service needs to score must be reconstructable from Postgres after a restart, so the only correct place for an accepted event is the state layer it will be wired to.
+Every refusal is a 4xx, and none is a silent drop:
+
+| Refusal | Status | Cause |
+| --- | --- | --- |
+| Unknown event type, unknown field, missing field | 422 | FastAPI's own validation, with field-level detail |
+| A value that fails its exact format, or an empty identity field | 422 | `MalformedEventError` from the state layer, raised at conversion |
+| An inpatient discharge whose patient has no recorded demographics | 422 | `UnknownPatientError`, naming the patient |
+| An event contradicting one already stored under the same key | 409 | `EventConflictError`, naming the differing fields |
+
+The unknown-patient case is an ordering violation rather than a bad payload: the cohort rules need a birthdate, so demographics must precede a patient's first discharge. Reporting it rather than skipping the score is the point, since a silently unscored discharge would look identical to a cohort exclusion. The event is still stored before the refusal, so re-posting that discharge once the demographics arrive scores it normally.
+
+Accepted events answer 202 rather than 200, which stays honest for the events that are not scoring events: a medication, a condition, an open stay, or a cohort-excluded encounter all update state and produce no score.
+
+## The scoring path
+
+`risk_scoring.service.ingest.ingest_event` is the whole path, as a plain function over a connection and a loaded model. The endpoint is a thin wrapper around it, so the replay harness can drive the same code without HTTP.
+
+1. Persist the event through `state.record_event`, which commits it on its own.
+2. If it is not an encounter, stop. Nothing but a discharge can be a scoring event.
+3. If the predictions log already holds a row for this encounter, stop.
+4. Read the patient's history and call `serving.serving_features`, which narrows the same `build_cohort` and `build_features` the training pipeline calls. A `None` means "state updated, nothing to score" for every reason at once: still open, wrong encounter class, in-hospital death, under 18.
+5. Cast the feature row to the model input columns as float64, exactly as training does, score it, and write the log row.
+
+Nothing in that sequence re-expresses a cohort or feature rule, which is what keeps "one cohort module and one feature module, shared verbatim" structural.
+
+The endpoint handler is async only long enough to read the raw body for the hash. Everything after that (database, pandas, the model) runs in the threadpool, so one slow scoring call cannot stall the event loop. Connections come from a `psycopg_pool` pool opened at startup rather than one connection per request, since a replay posts events continuously.
+
+## Predictions log
+
+One row per scored discharge, in the `predictions` table (migration `0004_predictions`):
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| `prediction_id` | `bigserial` | primary key |
+| `patient_id`, `encounter_id` | `text` | `encounter_id` is unique |
+| `event_time` | `timestamptz` | the discharge instant in simulated time |
+| `scored_at` | `timestamptz` | wall clock at write, defaulted by the database |
+| `input_hash` | `text` | SHA-256 over the exact posted event |
+| `model_name`, `model_version` | `text`, `integer` | the registered version that scored it |
+| `feature_version`, `cohort_version` | `text` | the shared modules' own versions |
+| `score` | `double precision` | |
+| `features` | `jsonb` | the 14 model input values, as the model received them |
+
+The table uses real column types, unlike the verbatim strings in the state tables. State stores exact bytes because serving-time recompute must be byte-identical to the batch path; the log is read instead by rolling time window and by numeric score, so `event_time` is indexed and typed. The parse from the encounter's verbatim STOP is lossless, since every stored value has already round-tripped through the same exact format.
+
+The feature values are stored rather than recomputed on demand, so diagnosing a suspect score later never requires rebuilding the patient's state as it was.
+
+### Why the log is the idempotency authority
+
+The state tables commit per event, and the prediction commits separately. A process can therefore die with an encounter durably stored and its score not, which would leave a permanent gap in the log across a restart.
+
+Deciding whether to score by the *absence of a prediction row*, rather than by whether the state write was new, closes that window. A re-posted encounter is a no-op in state but still has no score, so it gets one; `ON CONFLICT (encounter_id) DO NOTHING` settles the race if two writers reach it at once. The first score for an encounter stands: a conflicting write is dropped, never merged and never overwritten, so a replay that revisits a discharge cannot rewrite history.
+
+A separate test restates the whole schema literally, column names, types, nullability, and both constraints, so a migration cannot change the substrate every later phase reads without someone changing it in two places on purpose.
 
 ## Input hash
 
@@ -135,3 +188,17 @@ The pin must be an explicit positive integer. The loader rejects strings (includ
 Decision: when the service gets its own Compose block, the container bind-mounts `mlflow.db` and `mlruns/` read-only. One registry stays the single source of truth for training, gating, and serving, and promotion remains an edit to one committed config value. The alternative, baking the model artifact into the image at build time, was rejected as the default because it forks the registry into per-image copies; it remains the recorded fallback if the mount proves brittle.
 
 Two known risks may trigger that fallback, and the restart tests against real containers will decide. First, `configure_tracking` pins each experiment's artifact location as an absolute `file://` URI of the training machine, and model loading resolves artifacts through the URI stored in the database, so the mount must reproduce the host's absolute path inside the container or the stored URIs must be regenerated. Second, SQLite on a read-only bind mount can fail on lock or journal acquisition depending on journal state; opening the database with `mode=ro&immutable=1`, or copying it in at startup, are the candidate mitigations. No Dockerfile exists yet: nothing in the service shell requires a container, and the service's Compose block waits until the ingestion path writes state, so the shared Compose file grows in one place at a time.
+
+## Provenance confirmed on generated data
+
+The scoring path was run against the real local registry and a real PostgreSQL database, using one patient drawn from the frozen baseline population rather than a fixture. The patient's full history up to the target discharge was posted as an event stream in timestamp order, one event per request: 1 demographics event, 689 encounters, 76 medications, and 60 conditions, 826 events in all. Three of those encounters are adult inpatient discharges, and the service scored exactly those three on arrival.
+
+`GET /version` reported model `readmission-risk` version 3, `FEATURE_VERSION` 1.0.0, `COHORT_VERSION` 1.0.0, and the serving commit's SHA.
+
+The worked example traces the target discharge, encounter `31576c3d-e3a7-4eef-65ed-76d4163d1611`, discharged 2025-11-01T04:08:50Z, logged as prediction 3 with score 0.013610957904194856:
+
+- Recomputing SHA-256 over the exact posted event reproduced the logged `input_hash` `5e945dd96340053624d11903d252f852ec58a857600dd54d5caa27b42ff5260c`.
+- Loading `models:/readmission-risk/3` from MLflow and re-scoring the logged feature values reproduced the logged score exactly, to the last bit, with no tolerance.
+- The stored features are `age_at_discharge` 63, `los_days` 1, `prior_inpatient_180d` 0, `days_since_prev_discharge` 365 (the no-history sentinel), `prior_ed_180d` 1, `active_medication_count` 7, `active_disorder_count` 11, and the diabetes, MI, and renal flags set.
+
+Two properties were checked alongside it. Re-posting the same discharge answered 202 with `scored: false` and left the table at three rows. Running the batch pipeline over the same rows produced the same three cohort discharges, and every one of the 42 logged feature values matched its batch value exactly.

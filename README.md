@@ -50,9 +50,37 @@ Recomputing from raw history is what lets serving call the shared modules rather
 
 A test in CI asserts that the two paths agree. It builds a population that lands on every feature boundary at once, runs the batch pipeline over it, then interleaves the same rows into one timestamp-ordered stream, ingests them one event at a time, and scores each discharge from persisted state alone. The two sets of feature values must be exactly equal, not equal within a tolerance. The same comparison run against generated data matched on every feature of all 1,202 discharges in a 500-patient sample, and [docs/service-notes.md](docs/service-notes.md) records the storage decisions, the arrival-time rules, and that run.
 
+## Running the scoring service
+
+The service scores one event stream, in timestamp order, one event at a time. Start Postgres, apply the migrations, then serve:
+
 ```bash
 docker compose up -d postgres && python -m risk_scoring.db migrate
 ```
+
+```bash
+python -m risk_scoring.service run
+```
+
+Startup loads the model version pinned in `configs/service.toml` from the MLflow registry and opens a connection pool. Either one failing stops the service from starting, so a 200 from the health endpoint means the service can actually score and store rather than that a process is alive. The pin must be an explicit registered version number: strings, aliases, and "latest" are rejected, and no code path resolves the newest version.
+
+| Endpoint | What it does |
+| --- | --- |
+| `GET /health` | Reports readiness. |
+| `GET /version` | Model name and version, feature-pipeline version, cohort version, and the serving commit's SHA. |
+| `POST /events` | Ingests one event and answers 202 with its input hash, plus the score and prediction id when the event was a discharge worth scoring. |
+
+An event is `{"event_type": "...", "payload": {...}}`, where the type is one of `patient`, `encounter`, `medication`, or `condition` and the payload carries the generator columns the shared modules read. Demographics must precede a patient's first discharge, because the cohort rules need a birthdate.
+
+Posting an encounter that the cohort rules admit as an adult inpatient discharge computes that patient's features from persisted state, scores them, and writes one row to the prediction log. Everything else updates state and produces no score: medications, conditions, stays still open, and encounters the cohort rules exclude. Nothing is dropped silently: a malformed payload, a discharge arriving before its patient's demographics, and an event contradicting one already stored are all refused with a 4xx that says which.
+
+## The prediction log
+
+Every score is written with the provenance needed to reconstruct it later: the patient and encounter, the discharge instant and the wall clock at scoring, a SHA-256 hash of the exact event bytes that triggered it, the registered model version, the feature-pipeline and cohort versions, the score, and the feature values the model actually received. Storing the features means diagnosing a suspect score never requires rebuilding a patient's history as it was at that moment.
+
+A discharge has exactly one score, enforced by the database rather than by convention, so replaying a stream cannot duplicate history or rewrite it. That uniqueness is also what makes an interrupted run safe to resume: whether a discharge still needs scoring is decided by whether the log holds it, not by whether the event was new, so an event that was stored while its score was not gets scored when the stream replays it.
+
+A worked trace against generated data, from a logged row back through its input hash and model version to an exact re-score, is recorded in [docs/service-notes.md](docs/service-notes.md).
 
 ## Labels and training
 
@@ -86,4 +114,6 @@ That command goes from raw generator output to a registered model version, gates
 
 ## Current Status
 
-Early in development. The data spine exists (frozen synthetic populations plus verification tooling), the cohort, feature, and label layers are implemented and tested, and a single command retrains from raw generator output into a registered model version and a gate report, with results recorded in [docs/training-notes.md](docs/training-notes.md) and [docs/gate-notes.md](docs/gate-notes.md). Postgres-backed per-patient state and the serving-time feature path now exist behind that, with training-serving agreement asserted in CI and confirmed against generated data. The repository does not yet contain a runnable service; setup and replay instructions will be added to this README once the HTTP layer lands.
+Early in development. The data spine exists (frozen synthetic populations plus verification tooling), the cohort, feature, and label layers are implemented and tested, and a single command retrains from raw generator output into a registered model version and a gate report, with results recorded in [docs/training-notes.md](docs/training-notes.md) and [docs/gate-notes.md](docs/gate-notes.md).
+
+The service now runs: it ingests events over HTTP into Postgres-backed per-patient state, scores admitted discharges through the same feature module the training pipeline uses, and logs every prediction with full provenance. Training-serving agreement is asserted in CI and confirmed against generated data. What does not exist yet is the replay harness that drives the stream on a simulated clock, so events are posted by scripted batches rather than streamed, and no monitoring or retraining loop reads the prediction log yet.
