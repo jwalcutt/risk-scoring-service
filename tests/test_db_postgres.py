@@ -20,6 +20,7 @@ EXPECTED_TABLES = {
     "encounters",
     "medications",
     "conditions",
+    "predictions",
 }
 
 
