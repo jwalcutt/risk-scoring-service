@@ -34,10 +34,12 @@ EVENT_TYPES: list[tuple[str, RowFactory, str, str]] = [
     ("condition", make_condition_row, "ConditionEvent", "record_condition"),
 ]
 
+# Medications are absent: their natural key is their whole payload, so a
+# medication event cannot diverge. Every other type carries fields outside
+# its key that a buggy producer could contradict.
 DIVERGENT_OVERRIDES: dict[str, dict[str, str]] = {
     "patient": {"DEATHDATE": "2024-06-01"},
     "encounter": {"ENCOUNTERCLASS": "inpatient"},
-    "medication": {"STOP": "2024-02-01T08:00:00Z"},
     "condition": {"DESCRIPTION": "Something else (disorder)"},
 }
 
@@ -148,7 +150,9 @@ def test_repost_identical_event_is_noop(
 
 
 @pytest.mark.parametrize(
-    ("label", "make_row"), [(t[0], t[1]) for t in EVENT_TYPES], ids=[t[0] for t in EVENT_TYPES]
+    ("label", "make_row"),
+    [(t[0], t[1]) for t in EVENT_TYPES if t[0] in DIVERGENT_OVERRIDES],
+    ids=[t[0] for t in EVENT_TYPES if t[0] in DIVERGENT_OVERRIDES],
 )
 def test_repost_divergent_event_raises_conflict(
     db_conn: psycopg.Connection[Any], label: str, make_row: RowFactory
@@ -170,7 +174,6 @@ def test_repost_divergent_event_raises_conflict(
     expected_columns = {
         "patient": state.PATIENT_COLUMNS,
         "encounter": state.ENCOUNTER_COLUMNS,
-        "medication": state.MEDICATION_COLUMNS,
         "condition": state.CONDITION_COLUMNS,
     }[label]
     pd.testing.assert_frame_equal(stored, _frame([row], expected_columns))
@@ -220,3 +223,26 @@ def test_empty_optional_fields_round_trip_as_empty_strings(
     assert history.patients.loc[0, "DEATHDATE"] == ""
     assert history.medications.loc[0, "STOP"] == ""
     assert history.conditions.loc[0, "STOP"] == ""
+
+
+def test_same_drug_same_encounter_same_start_but_different_stop_are_distinct(
+    db_conn: psycopg.Connection[Any],
+) -> None:
+    """Synthea emits a single dispense and a continuing course as two rows.
+
+    They share patient, encounter, code, and start, differing only in stop
+    and the cost columns the payload drops, so the medication key must carry
+    stop or the second row is lost and the active-medication count undercounts.
+    """
+    single_dispense = make_medication_row(STOP="2016-11-23T03:09:52Z", START="2016-11-23T03:09:52Z")
+    year_long = make_medication_row(STOP="2017-11-29T03:09:52Z", START="2016-11-23T03:09:52Z")
+
+    assert _record(db_conn, "medication", single_dispense) is True
+    assert _record(db_conn, "medication", year_long) is True
+    assert _record(db_conn, "medication", year_long) is False
+
+    history = state.patient_history(db_conn, "patient-1")
+    assert history.medications["STOP"].tolist() == [
+        "2016-11-23T03:09:52Z",
+        "2017-11-29T03:09:52Z",
+    ]

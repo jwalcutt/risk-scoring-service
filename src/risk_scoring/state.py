@@ -203,7 +203,7 @@ _ENCOUNTER_SPEC = _TableSpec(
 _MEDICATION_SPEC = _TableSpec(
     table="medications",
     db_columns=("start", "stop", "patient", "encounter", "code"),
-    key_columns=("patient", "encounter", "code", "start"),
+    key_columns=("patient", "encounter", "code", "start", "stop"),
     frame_columns=MEDICATION_COLUMNS,
     patient_column="patient",
 )
