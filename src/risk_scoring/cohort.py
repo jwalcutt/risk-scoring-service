@@ -28,7 +28,7 @@ Judgment calls this module fixes:
   non-conforming value raises here instead.
 - An inpatient encounter whose patient id has no patients.csv row raises
   rather than being dropped, because a silent drop would mask joined-data
-  corruption in later replay phases.
+  corruption when the same rows are streamed back through a replay.
 """
 
 from __future__ import annotations

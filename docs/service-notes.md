@@ -157,7 +157,7 @@ The state tables commit per event, and the prediction commits separately. A proc
 
 Deciding whether to score by the *absence of a prediction row*, rather than by whether the state write was new, closes that window. A re-posted encounter is a no-op in state but still has no score, so it gets one; `ON CONFLICT (encounter_id) DO NOTHING` settles the race if two writers reach it at once. The first score for an encounter stands: a conflicting write is dropped, never merged and never overwritten, so a replay that revisits a discharge cannot rewrite history.
 
-A separate test restates the whole schema literally, column names, types, nullability, and both constraints, so a migration cannot change the substrate every later phase reads without someone changing it in two places on purpose.
+A separate test restates the whole schema literally, column names, types, nullability, and both constraints, so a migration cannot change this substrate without someone changing it in two places on purpose.
 
 ## Input hash
 
@@ -193,7 +193,7 @@ The absolute-path risk was real and is handled by construction. `configure_track
 
 The SQLite risk did not materialize. The database is in `delete` journal mode, not WAL, so a read needs no writable sidecar, and a read-only mount serves model resolution without complaint. `mlflow.db` is mounted read-only and stays that way.
 
-The third risk was the one that bit. Loading a `models:/name/version` URI is not a pure read: MLflow writes a derived `registered_model_meta` file beside the artifact on every load, recording the registered name and version the local copy came from. A read-only `mlruns/` fails that write with `OSError: [Errno 30] Read-only file system` before the model ever loads. `mlruns/` is therefore mounted writable while `mlflow.db` stays read-only, which is the narrowest thing that works: the container can rewrite a 48-byte derived sidecar that the host service already writes with identical content, and it cannot alter the registry itself, which is what "single source of truth" means here. Copying the artifact store into the container at startup would restore full immutability at the cost of an entrypoint script and a per-start copy; that is the recorded escalation if a later phase needs the artifact store genuinely untouchable.
+The third risk was the one that bit. Loading a `models:/name/version` URI is not a pure read: MLflow writes a derived `registered_model_meta` file beside the artifact on every load, recording the registered name and version the local copy came from. A read-only `mlruns/` fails that write with `OSError: [Errno 30] Read-only file system` before the model ever loads. `mlruns/` is therefore mounted writable while `mlflow.db` stays read-only, which is the narrowest thing that works: the container can rewrite a 48-byte derived sidecar that the host service already writes with identical content, and it cannot alter the registry itself, which is what "single source of truth" means here. Copying the artifact store into the container at startup would restore full immutability at the cost of an entrypoint script and a per-start copy; that is the recorded escalation if the artifact store ever needs to be genuinely untouchable.
 
 ## The container and the Compose stack
 
@@ -201,7 +201,7 @@ The third risk was the one that bit. Loading a `models:/name/version` URI is not
 
 | Service | Role |
 | --- | --- |
-| `postgres` | State, the prediction log, and everything later phases add. Host port 5433. |
+| `postgres` | State, the prediction log, and whatever is built on them. Host port 5433. |
 | `migrate` | One-shot `python -m risk_scoring.db migrate`, gated on Postgres reporting healthy. |
 | `app` | The service, gated on `migrate` completing successfully. Host port 8001. |
 

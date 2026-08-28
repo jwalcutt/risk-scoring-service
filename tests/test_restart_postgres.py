@@ -4,7 +4,8 @@ The service holds nothing across requests that it did not derive at
 startup: the loaded model, the connection pool, the frozen config, and the
 git SHA. Everything a score depends on lives in Postgres. That makes the
 rebuild path structurally trivial, so these tests exist to keep it that
-way and to prove the property the phase criterion actually asks for.
+way and to prove that a restarted service resumes with no log gaps and
+correct state, rather than assuming it from the structure.
 
 The rules these tests pin:
 

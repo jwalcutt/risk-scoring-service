@@ -1,6 +1,6 @@
 """The predictions log schema, asserted column by column.
 
-Every later phase reads this table: drift windows, realized performance,
+Everything downstream reads this table: drift windows, realized performance,
 shadow comparison, and the ablation all query it, and the writeup traces
 a score back through it. A migration that renames a column, widens a
 type, or drops the uniqueness that keeps one score per discharge would

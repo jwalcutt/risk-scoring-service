@@ -5,8 +5,8 @@ The rules these tests pin:
 - One row per scored encounter. The encounter id is the log's
   idempotency key, so a second write for the same encounter adds
   nothing and says so by returning None rather than raising.
-- Every provenance field a later phase needs to trace a score back to
-  its exact model and input round-trips unchanged, including the feature
+- Every provenance field needed to trace a score back to its exact model
+  and input round-trips unchanged, including the feature
   values, which are stored so diagnosis never has to recompute them.
 - Floating-point values survive the round trip exactly. A score or a
   feature value that shifts in storage would make the stored row a
