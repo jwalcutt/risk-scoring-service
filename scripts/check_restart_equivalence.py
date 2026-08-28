@@ -22,12 +22,9 @@ design and say nothing about whether the two runs agree.
 from __future__ import annotations
 
 import argparse
-import http.client
-import json
 import os
 import subprocess
 import sys
-import time
 import uuid
 from dataclasses import asdict
 from pathlib import Path
@@ -40,13 +37,12 @@ from risk_scoring import db as db_module
 from risk_scoring import predictions
 from risk_scoring.populations import load_population
 from risk_scoring.sampling import sample_patients
+from risk_scoring.service_client import DEFAULT_SERVICE_PORT, ServiceClient
 from risk_scoring.stream import build_stream
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 VOLATILE_COLUMNS = ("prediction_id", "scored_at")
-DEFAULT_SERVICE_PORT = 8001
-HEALTH_TIMEOUT_SECONDS = 180.0
 
 
 def compose(arguments: list[str], env: dict[str, str]) -> None:
@@ -87,47 +83,6 @@ def compose_env(*, database: str, port: int) -> dict[str, str]:
     }
 
 
-def wait_for_health(port: int, timeout: float = HEALTH_TIMEOUT_SECONDS) -> None:
-    deadline = time.monotonic() + timeout
-    last = "no attempt made"
-    while time.monotonic() < deadline:
-        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
-        try:
-            connection.request("GET", "/health")
-            response = connection.getresponse()
-            response.read()
-            if response.status == 200:
-                return
-            last = f"status {response.status}"
-        except OSError as error:
-            last = str(error)
-        finally:
-            connection.close()
-        time.sleep(1.0)
-    raise TimeoutError(f"the service never became healthy on port {port} ({last})")
-
-
-def post_events(port: int, events: list[dict[str, Any]]) -> None:
-    """Post the events one at a time over one kept-alive connection."""
-    if not events:
-        return
-    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
-    try:
-        for event in events:
-            connection.request(
-                "POST",
-                "/events",
-                body=json.dumps(event),
-                headers={"content-type": "application/json"},
-            )
-            response = connection.getresponse()
-            body = response.read()
-            if response.status != 202:
-                raise RuntimeError(f"{event['event_type']} refused: {response.status} {body!r}")
-    finally:
-        connection.close()
-
-
 def read_log(url: str) -> list[dict[str, Any]]:
     """The prediction log, minus the fields the database assigns."""
     with psycopg.connect(url, connect_timeout=5) as conn:
@@ -152,21 +107,23 @@ def run_arm(
         # The migrate service applies the schema to the new database before
         # the app is allowed to start.
         compose(["up", "-d", "--build"], env)
-        wait_for_health(port)
-        if restart_at is None:
-            post_events(port, events)
-        else:
-            post_events(port, events[:restart_at])
-            before = app_started_at(env)
-            compose(["restart", "app"], env)
-            wait_for_health(port)
-            # A restart that silently did nothing would let a service holding
-            # state in memory pass this check, so require the process cycled.
-            if app_started_at(env) == before:
-                raise RuntimeError(
-                    f"the service container never restarted (still up since {before})"
-                )
-            post_events(port, events[restart_at:])
+        with ServiceClient(port=port) as client:
+            client.wait_for_health()
+            if restart_at is None:
+                client.post_events(events)
+            else:
+                client.post_events(events[:restart_at])
+                before = app_started_at(env)
+                compose(["restart", "app"], env)
+                client.wait_for_health()
+                # A restart that silently did nothing would let a service
+                # holding state in memory pass this check, so require the
+                # process cycled.
+                if app_started_at(env) == before:
+                    raise RuntimeError(
+                        f"the service container never restarted (still up since {before})"
+                    )
+                client.post_events(events[restart_at:])
         return read_log(url)
     finally:
         compose(["stop", "app"], env)
