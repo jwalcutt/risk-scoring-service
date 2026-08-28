@@ -10,6 +10,14 @@ python -m risk_scoring.gate run --population baseline --report gate_report.md
 
 The command gates the latest registered version of `readmission-risk` (or a specific one via `--model-version`), prints the full report, and exits nonzero on a failing verdict, which is what lets CI block on it. The holdout is rebuilt from the raw CSVs using the split seed, holdout fraction, and cutoff read from the model version's own training run, so the gate cannot drift from what training did.
 
+Training and gating also chain into one unattended command:
+
+```bash
+python -m risk_scoring.pipeline retrain --population baseline --report gate_report.md
+```
+
+The chained form trains, registers, and then gates the version it just registered, passing that version number explicitly rather than resolving the newest entry in the registry. Its exit code is the gate's verdict. A failing candidate is left registered and tagged `gate_verdict=fail` and its report is still written, so a rejected model leaves a record instead of vanishing. `risk_scoring.pipeline.retrain` is the library seam behind the command, and the retraining automation built later calls it rather than reimplementing the sequence.
+
 ## Checks
 
 The verdict is pass only when every check passes.
@@ -42,3 +50,9 @@ Each gate execution writes a new MLflow run tagged `run_type=gate` in the same e
 ## First gate run
 
 The registered version 1 (training notes in [training-notes.md](training-notes.md)) passed the gate on 2026-08-27: AUROC 0.8617 with a 95% interval of [0.8087, 0.9103], ECE 0.0371 [0.0195, 0.0589], Brier 0.0838 [0.0550, 0.1100], and an exact holdout reproduction. The subgroup table surfaced one honest weakness worth carrying forward: discrimination among patients with the heart-failure flag is near chance (AUROC 0.48 on 85 rows), and the 65-to-79 age band trails the overall score at 0.73. Neither moves the verdict under the current report-only policy, but both are the kind of number the subgroup table exists to surface.
+
+## Exit check, 2026-08-27
+
+The chained command was run against the frozen baseline after the three populations reverified clean against their committed manifests. It produced version 3 of `readmission-risk` (run `3541db36490b4656a81b137f229a4f1b`) and a passing report in 17 seconds, with no manual step between raw CSVs and the report: AUROC 0.8617 [0.8087, 0.9103], ECE 0.0371 [0.0195, 0.0589], Brier 0.0838, and an exact holdout reproduction. Version 2, registered minutes earlier by running training and the gate as separate commands, carries identical numbers.
+
+Reproducing version 1's metrics to four decimals from a fresh run over the raw CSVs is the useful result here, not the verdict. Row counts (9,049 training rows across 3,564 patients, 2,245 holdout rows across 892 patients), prevalence, AUROC, and PR-AUC all match the original run, so the split, the feature computation, and the booster are deterministic end to end. The subgroup weaknesses recorded for version 1 reappear unchanged, heart failure at 0.4831 on 85 rows and the 65-to-79 band at 0.7316, which is what a deterministic pipeline should do.

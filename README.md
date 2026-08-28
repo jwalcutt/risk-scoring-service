@@ -64,6 +64,14 @@ python -m risk_scoring.gate run --population baseline --report gate_report.md
 
 The gate rebuilds the model's patient-grouped holdout from raw generator output, using the split parameters logged on that model's own training run, and judges it against fixed criteria: held-out AUROC inside the pre-registered signal band, expected calibration error at most 0.05, and an exact reproduction of the training run's logged holdout score. A score above the band ceiling fails loudly as suspected leakage; a test proves this by training a candidate on a deliberately leaked patient split and confirming the gate flags the inflated score. Every metric carries a bootstrap confidence interval resampled at the patient level, and the report breaks results down by age band, sex, and comorbidity flag. Results land in MLflow as a tagged gate run with the full report attached, and the gated model version is tagged with its verdict. CI runs the gate end to end on a synthetic population and fails on a failing verdict. Criteria and method are documented in [docs/gate-notes.md](docs/gate-notes.md).
 
+Training and gating also run as one unattended command, which is how CI and later retraining automation invoke them:
+
+```bash
+python -m risk_scoring.pipeline retrain --population baseline --report gate_report.md
+```
+
+That command goes from raw generator output to a registered model version, gates that exact version rather than whatever is newest in the registry, writes the report, and exits nonzero on a failing verdict. A failed candidate stays registered and its report stays on disk, because the record of what failed is the point of running the gate.
+
 ## Current Status
 
-Early in development. The data spine exists (frozen synthetic populations plus verification tooling), the cohort, feature, and label layers are implemented and tested, and the first model is trained, registered in the MLflow registry, and passed through the evaluation gate, with results recorded in [docs/training-notes.md](docs/training-notes.md) and [docs/gate-notes.md](docs/gate-notes.md). The repository does not yet contain a runnable service; setup and replay instructions will be added to this README once the infrastructure falls into place.
+Early in development. The data spine exists (frozen synthetic populations plus verification tooling), the cohort, feature, and label layers are implemented and tested, and a single command retrains from raw generator output into a registered model version and a gate report, with results recorded in [docs/training-notes.md](docs/training-notes.md) and [docs/gate-notes.md](docs/gate-notes.md). The repository does not yet contain a runnable service; setup and replay instructions will be added to this README once the infrastructure falls into place.
