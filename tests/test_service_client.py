@@ -20,6 +20,11 @@ from risk_scoring.service_client import ServiceClient
 
 Responder = Callable[[str, str], tuple[int, dict[str, Any]]]
 
+# A responder returns this status to close the connection without
+# answering, which is what the client sees when the service it kept a
+# connection open to has gone away.
+_DROP = -1
+
 
 class _Counter:
     def __init__(self) -> None:
@@ -43,6 +48,9 @@ def _serve(responder: Responder, counter: _Counter) -> type[BaseHTTPRequestHandl
             body = self.rfile.read(length).decode() if length else ""
             counter.requests.append((self.path, body))
             status, payload = responder(self.path, body)
+            if status == _DROP:
+                self.close_connection = True
+                return
             encoded = json.dumps(payload).encode()
             self.send_response(status)
             self.send_header("content-type", "application/json")
@@ -187,3 +195,56 @@ def test_a_2xx_that_is_not_202_is_still_refused(
     with ServiceClient(port=port) as client, pytest.raises(RuntimeError) as raised:
         client.post_event(_event("encounter"))
     assert "200" in str(raised.value)
+
+
+class _Drops:
+    """A responder that closes the connection on the requests named."""
+
+    def __init__(self, *, on: set[int]) -> None:
+        self.on = on
+        self.seen = 0
+
+    def __call__(self, path: str, body: str) -> tuple[int, dict[str, Any]]:
+        self.seen += 1
+        if self.seen in self.on:
+            return _DROP, {}
+        return _accepts(path, body)
+
+
+def test_a_dropped_kept_alive_connection_is_reopened(
+    server: Callable[[Responder], tuple[int, _Counter]],
+) -> None:
+    """Restarting the service leaves the client holding a dead socket.
+
+    The container check posts half a stream, restarts the service, waits
+    for it to report healthy, and posts the rest. The connection carrying
+    the stream does not survive that restart, and the service being back
+    is what makes reopening it the right answer rather than a guess.
+    """
+    port, counter = server(_Drops(on={2}))
+    with ServiceClient(port=port) as client:
+        acknowledgements = client.post_events([_event() for _ in range(3)])
+    assert len(acknowledgements) == 3
+    assert counter.connections == 2
+
+
+def test_the_retry_is_bounded_at_one_reconnect(
+    server: Callable[[Responder], tuple[int, _Counter]],
+) -> None:
+    """A service that is genuinely gone must fail, not be retried forever."""
+    port, counter = server(_Drops(on={2, 3}))
+    with ServiceClient(port=port) as client:
+        client.post_event(_event())
+        with pytest.raises(ConnectionError):
+            client.post_event(_event())
+    assert counter.connections == 2
+
+
+def test_a_drop_on_a_fresh_connection_is_not_retried(
+    server: Callable[[Responder], tuple[int, _Counter]],
+) -> None:
+    """Only a connection the server already answered on is worth reopening."""
+    port, counter = server(_Drops(on={1}))
+    with ServiceClient(port=port) as client, pytest.raises(ConnectionError):
+        client.post_event(_event())
+    assert counter.connections == 1

@@ -296,3 +296,21 @@ All 735 predictions reproduced. The worked example is the held-out prediction at
 - The stored features are `age_at_discharge` 59, `los_days` 7.345879629629629, `prior_inpatient_180d` 0, `days_since_prev_discharge` 365 (the no-history sentinel), `prior_ed_180d` 0, `active_medication_count` 7, `active_disorder_count` 10, and the diabetes, malignancy, and renal flags set.
 
 Running the same command a second time against the same database logged nothing new and still reported 735 predictions reproduced, since a discharge already carrying a prediction is not scored again.
+
+## All three checks re-run together
+
+Recorded 2026-08-28, at commit `5cc09c5`, against the same containers and the same frozen baseline population, in one sitting:
+
+```bash
+python scripts/check_serving_skew.py --population baseline --patients 500
+python scripts/check_restart_equivalence.py --population baseline --patients 25
+python -m risk_scoring.scoring_run run --population baseline --patients 250
+```
+
+Serving features matched the batch pipeline on all 1,202 discharges of the 500-patient sample, 119,460 events ingested, 4 minutes 59 seconds. The restarted container produced a prediction log identical to the uninterrupted arm on all 42 discharges of the 25-patient sample, 5,641 events with the restart after 2,820, 89 seconds. The held-out batch posted 57,920 events for 250 patients and scored 326 held-out and 409 pre-cutoff discharges, and all 735 predictions reproduced their input hash and their score, 173 seconds. The batch ran against an empty database and reproduced the earlier run exactly, down to the worked example landing on the same prediction id.
+
+The restart check failed the first time it ran, and the reason is worth keeping. The client that posts the stream holds one connection open for the whole run, which is what makes sixty thousand requests affordable. Restarting the service container kills that connection. The script waits for health before posting the rest of the stream, so the service was back and ready, but the first post after the restart went down a dead socket and raised `RemoteDisconnected`.
+
+That connection was hoisted to run scope when the posting code moved out of the check script and into `risk_scoring.service_client`, and the check had not been run against the containers since. Nothing in CI could catch it: the restart test there drives the app in process through a test client, which has no socket to lose. The equivalent hazard for a caller that never restarts anything is an idle service closing a kept-alive connection on its own timeout.
+
+`ServiceClient` now reopens the connection once and repeats the request, but only when the connection had already carried a request, since one that fails on its first use was never established rather than dropped. Repeating a post is safe because the service treats a re-posted event as a no-op, and the retry is bounded at one so a service that is genuinely gone fails rather than spins. Three tests in `tests/test_service_client.py` cover the reopen, the bound, and the refusal to retry a fresh connection.
