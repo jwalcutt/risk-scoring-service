@@ -81,15 +81,20 @@ def ordered_events(
     return sorted(events, key=lambda event: event.sort_key)
 
 
+def envelope(kind: str, row: Mapping[str, str]) -> dict[str, Any]:
+    """One row as the event the service is posted, projected to the contract fields.
+
+    The batch driver and the replay harness both post through this, so a
+    row reaches the service as the same bytes whichever of them sends it.
+    """
+    return {"event_type": kind, "payload": {name: row[name] for name in EVENT_FIELDS[kind]}}
+
+
 def build_stream(frames: Mapping[str, pd.DataFrame]) -> list[dict[str, Any]]:
     """The whole population as posted event envelopes, demographics first."""
-
-    def event(kind: str, row: Mapping[str, str]) -> dict[str, Any]:
-        return {"event_type": kind, "payload": {name: row[name] for name in EVENT_FIELDS[kind]}}
-
-    stream = [event("patient", dict(row)) for _, row in frames["patients"].iterrows()]
+    stream = [envelope("patient", dict(row)) for _, row in frames["patients"].iterrows()]
     stream += [
-        event(item.kind, item.row)
+        envelope(item.kind, item.row)
         for item in ordered_events(
             frames["encounters"], frames["medications"], frames["conditions"]
         )

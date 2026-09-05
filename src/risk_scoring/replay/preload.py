@@ -65,6 +65,15 @@ def history_before(events: Sequence[StreamEvent], before: str) -> list[StreamEve
     return [event for event in events if event.at < before]
 
 
+def replay_from(events: Sequence[StreamEvent], start: str) -> list[StreamEvent]:
+    """The events dated at or after an instant, in stream order.
+
+    The exact complement of :func:`history_before`: what the preload does
+    not load is what the replay posts, and nothing falls between.
+    """
+    return [event for event in events if event.at >= start]
+
+
 def preload_history(
     conn: psycopg.Connection[Any],
     frames: Mapping[str, pd.DataFrame],

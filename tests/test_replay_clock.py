@@ -93,5 +93,17 @@ def test_next_tick_at_the_end_stays_there() -> None:
     assert clock.next_tick(end, end) == end
 
 
+def test_next_tick_takes_the_step_it_is_given() -> None:
+    """The tick-size test drives the loop at seven-day steps through this."""
+    now = datetime(2025, 1, 1, tzinfo=UTC)
+    end = datetime(2026, 1, 1, tzinfo=UTC)
+    assert clock.next_tick(now, end, tick=timedelta(days=7)) == datetime(2025, 1, 8, tzinfo=UTC)
+
+
+def test_next_tick_with_a_given_step_still_lands_on_the_end() -> None:
+    end = datetime(2025, 1, 3, tzinfo=UTC)
+    assert clock.next_tick(datetime(2025, 1, 1, tzinfo=UTC), end, tick=timedelta(days=7)) == end
+
+
 def test_the_wall_clock_is_time_dot_time() -> None:
     assert clock.DEFAULT_WALL_CLOCK is time.time

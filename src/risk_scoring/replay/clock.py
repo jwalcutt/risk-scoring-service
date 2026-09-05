@@ -15,7 +15,9 @@ Judgment calls this module fixes:
   honored within a second and long enough that the process is not
   spinning. Tick size must not change what a run writes; the tick loop's
   tests assert that, which is why the tick is a constant here and not a
-  configuration value.
+  configuration value. ``next_tick`` takes the step as an argument only so
+  those tests can drive the same loop at a seven-day step; nothing in
+  production passes anything but the constant.
 - The wall clock is ``time.time``. ``time.monotonic`` stops while the
   machine sleeps, so a sleeping laptop would freeze simulated time
   silently; ``time.time`` keeps counting, so on waking the harness finds
@@ -91,6 +93,6 @@ def instant(moment: datetime) -> str:
     return moment.astimezone(UTC).strftime(state.TIMESTAMP_FORMAT)
 
 
-def next_tick(sim_now: datetime, end_at: datetime) -> datetime:
+def next_tick(sim_now: datetime, end_at: datetime, *, tick: timedelta = TICK) -> datetime:
     """The simulated instant one tick on, clamped so the clock lands on the end."""
-    return min(sim_now + TICK, end_at)
+    return min(sim_now + tick, end_at)

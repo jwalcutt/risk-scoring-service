@@ -25,7 +25,7 @@ from factories import (
 )
 from risk_scoring import state
 from risk_scoring.service.events import Event
-from risk_scoring.stream import EVENT_FIELDS, build_stream, ordered_events
+from risk_scoring.stream import EVENT_FIELDS, build_stream, envelope, ordered_events
 
 _EVENT = TypeAdapter(Event)
 
@@ -195,3 +195,22 @@ def test_the_stream_covers_every_row_exactly_once() -> None:
 
 def test_an_empty_population_yields_an_empty_stream() -> None:
     assert build_stream(_population([], [], [], [])) == []
+
+
+# Envelopes
+
+
+def test_an_envelope_projects_exactly_the_contract_fields_in_order() -> None:
+    row = make_encounter_row(Id="e1", PATIENT="p1", STOP="")
+    posted = envelope("encounter", row)
+    assert posted["event_type"] == "encounter"
+    assert tuple(posted["payload"]) == EVENT_FIELDS["encounter"]
+    assert posted["payload"]["STOP"] == ""
+    assert _EVENT.validate_python(posted).event_type == "encounter"
+
+
+def test_build_stream_posts_the_same_envelope_the_harness_would() -> None:
+    """One projection, so the batch driver and the replay post identical bytes."""
+    encounter = make_encounter_row(Id="e1", PATIENT="p1")
+    stream = build_stream(_population([make_patient_row(Id="p1")], [encounter], [], []))
+    assert stream[1] == envelope("encounter", encounter)
