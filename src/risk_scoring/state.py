@@ -23,7 +23,7 @@ Judgment calls this module fixes:
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -349,3 +349,47 @@ def patient_history(conn: psycopg.Connection[Any], patient_id: str) -> PatientHi
         medications=_history_frame(conn, _MEDICATION_SPEC, patient_id, "start, encounter, code"),
         conditions=_history_frame(conn, _CONDITION_SPEC, patient_id, "start, encounter, code"),
     )
+
+
+def record_batch(conn: psycopg.Connection[Any], events: Sequence[AnyEvent]) -> int:
+    """Persist many events in one transaction and commit; the number that were new.
+
+    For loading history in bulk, where the per-row commit of
+    :func:`record_event` costs more than the write itself. The batch is
+    the unit of acknowledgement here: one commit covers it, and a caller
+    that dies mid-load resumes by loading again, since identical re-posts
+    are dropped by the conflict clause exactly as they are per row.
+
+    Divergence is still refused loudly. When fewer rows landed than the
+    batch holds, every event in it is re-run through :func:`record_event`,
+    which is a no-op for an identical re-post and raises
+    :class:`EventConflictError` for a divergent one. The batch has
+    committed by then, so what was new in it stays: nothing acknowledged
+    is ever rolled back.
+    """
+    if not events:
+        return 0
+    grouped: dict[type[AnyEvent], list[dict[str, str]]] = {}
+    for event in events:
+        grouped.setdefault(type(event), []).append(asdict(event))
+    inserted = 0
+    try:
+        for event_type, rows in grouped.items():
+            spec = _SPEC_BY_EVENT[event_type]
+            column_list = ", ".join(spec.db_columns)
+            placeholders = ", ".join(["%s"] * len(spec.db_columns))
+            with conn.cursor() as cursor:
+                cursor.executemany(
+                    f"INSERT INTO {spec.table} ({column_list}) VALUES ({placeholders})"
+                    f" ON CONFLICT ({', '.join(spec.key_columns)}) DO NOTHING",
+                    [[row[name] for name in spec.db_columns] for row in rows],
+                )
+                inserted += cursor.rowcount
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    if inserted < len(events):
+        for event in events:
+            record_event(conn, event)
+    return inserted

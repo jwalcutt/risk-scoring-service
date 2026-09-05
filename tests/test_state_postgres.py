@@ -272,3 +272,96 @@ def test_record_event_dispatches_on_the_event_type(
         "condition": history.conditions,
     }[label]
     assert len(stored) == 1
+
+
+# Batched writes, for loading history that predates a replay.
+
+
+def test_record_batch_reads_back_identical_to_per_row_recording(
+    db_conn: psycopg.Connection[Any],
+) -> None:
+    patient_row = make_patient_row()
+    early = make_encounter_row(Id="encounter-early", START="2023-06-01T08:00:00Z")
+    late = make_encounter_row(Id="encounter-late", START="2024-06-01T08:00:00Z")
+    medication_row = make_medication_row(ENCOUNTER="encounter-late")
+    condition_row = make_condition_row(ENCOUNTER="encounter-late")
+    events: list[state.AnyEvent] = [
+        state.PatientEvent.from_row(patient_row),
+        state.EncounterEvent.from_row(late),
+        state.MedicationEvent.from_row(medication_row),
+        state.EncounterEvent.from_row(early),
+        state.ConditionEvent.from_row(condition_row),
+    ]
+
+    assert state.record_batch(db_conn, events) == 5
+
+    history = state.patient_history(db_conn, "patient-1")
+    pd.testing.assert_frame_equal(history.patients, _frame([patient_row], state.PATIENT_COLUMNS))
+    pd.testing.assert_frame_equal(
+        history.encounters, _frame([early, late], state.ENCOUNTER_COLUMNS)
+    )
+    pd.testing.assert_frame_equal(
+        history.medications, _frame([medication_row], state.MEDICATION_COLUMNS)
+    )
+    pd.testing.assert_frame_equal(
+        history.conditions, _frame([condition_row], state.CONDITION_COLUMNS)
+    )
+
+
+def test_record_batch_survives_a_rollback(db_conn: psycopg.Connection[Any]) -> None:
+    """The batch commits as a whole; a later rollback cannot take it back."""
+    state.record_batch(db_conn, [state.EncounterEvent.from_row(make_encounter_row())])
+    db_conn.rollback()
+    assert len(state.patient_history(db_conn, "patient-1").encounters) == 1
+
+
+def test_record_batch_of_identical_reposts_is_a_noop(
+    db_conn: psycopg.Connection[Any],
+) -> None:
+    events: list[state.AnyEvent] = [
+        state.PatientEvent.from_row(make_patient_row()),
+        state.EncounterEvent.from_row(make_encounter_row()),
+    ]
+    state.record_batch(db_conn, events)
+
+    assert state.record_batch(db_conn, events) == 0
+    history = state.patient_history(db_conn, "patient-1")
+    assert (len(history.patients), len(history.encounters)) == (1, 1)
+
+
+def test_record_batch_counts_only_the_rows_that_were_new(
+    db_conn: psycopg.Connection[Any],
+) -> None:
+    """A batch that resumes over rows already loaded reports the new ones alone."""
+    first = state.EncounterEvent.from_row(make_encounter_row(Id="encounter-1"))
+    second = state.EncounterEvent.from_row(make_encounter_row(Id="encounter-2"))
+    state.record_batch(db_conn, [first])
+
+    assert state.record_batch(db_conn, [first, second]) == 1
+
+
+def test_record_batch_with_a_divergent_row_raises_and_keeps_the_new_rows(
+    db_conn: psycopg.Connection[Any],
+) -> None:
+    """Divergence is still refused loudly; what was new in the batch stays committed."""
+    stored = make_encounter_row(Id="encounter-1", ENCOUNTERCLASS="emergency")
+    _record(db_conn, "encounter", stored)
+    divergent = make_encounter_row(Id="encounter-1", ENCOUNTERCLASS="inpatient")
+    fresh = make_encounter_row(Id="encounter-2")
+
+    with pytest.raises(state.EventConflictError):
+        state.record_batch(
+            db_conn,
+            [state.EncounterEvent.from_row(divergent), state.EncounterEvent.from_row(fresh)],
+        )
+
+    history = state.patient_history(db_conn, "patient-1")
+    pd.testing.assert_frame_equal(
+        history.encounters, _frame([stored, fresh], state.ENCOUNTER_COLUMNS)
+    )
+    # The connection is still usable.
+    assert _record(db_conn, "encounter", make_encounter_row(Id="encounter-3")) is True
+
+
+def test_record_batch_of_nothing_records_nothing(db_conn: psycopg.Connection[Any]) -> None:
+    assert state.record_batch(db_conn, []) == 0
