@@ -75,7 +75,47 @@ The checkpoint is written after the tick's posts, never before. A refusal from t
 
 Only clinical events are posted. The preload loads every patient row, so demographics are in state before the first tick, and the harness stream is `preload.replay_from`, the exact complement of what the preload took. A splice has to keep that true for the population it brings in.
 
-The run summary an invocation returns covers the simulated span it advanced, events posted by kind, discharges scored as the service acknowledged them, ticks, wall time, and the largest wall gap between consecutive ticks. Label counts are not on it yet: a field that always reads zero would misdescribe a run, so the labels substep adds those fields when it adds the numbers. `harness.report` renders the summary as text for the commands that arrive next; the loop itself does not touch the run's status, and pause, resume, and the commands are that substep's work.
+The run summary an invocation returns covers the simulated span it advanced, events posted by kind, discharges scored as the service acknowledged them, ticks, wall time, the largest wall gap between consecutive ticks, and whether it stopped on a pause. Label counts are not on it yet: a field that always reads zero would misdescribe a run, so the labels substep adds those fields when it adds the numbers. The summary describes one invocation, not the whole run. Counters accumulated on the run row were considered and rejected: they would need a migration to duplicate what the prediction log and the row's wall timestamps already hold. `harness.report` renders the summary as text; the loop itself reads the run's status and never writes it.
+
+## The commands
+
+`python -m risk_scoring.replay` has four subcommands. `start` reads `configs/replay.toml` and its overrides, preloads history from before the start, opens the run row, and begins ticking. `resume` finds the open run, rebuilds the stream from the row's population, marks the row `running`, and continues from the checkpoint. `pause` marks the open run `paused` from any terminal. `status` prints the row: the run, its span, where the clock stands as an instant and a percentage of the span, the cursor's instant, and the wall times it was created and last written. `start` and `resume` take `--max-speed`, `--port` for the Compose service, and `--data-root` (default `data`) for the directory holding `<population>/csv`, so a test or a check script can point the real command at a synthetic or sampled export. The database is `RISK_SCORING_DATABASE_URL` or the Compose default, as everywhere else.
+
+`start` preloads before it opens the row. A Ctrl-C during a preload that takes minutes therefore leaves no row behind, and a second `start` finishes the idempotent load; the run exists only once its history is in state. It refuses, before loading anything, if the database already holds an unfinished run.
+
+`start` runs the clock as soon as the row exists, so one command takes a database from nothing to a ticking replay, and every later session is `resume` with no other argument. The alternative, a `start` that only prepared and left the first tick to `resume`, was rejected as one more step for the operator with nothing to show for it.
+
+`resume` accepts a row whose status still reads `running`. A harness that died without pausing (a kill signal, a crash, a lost machine) leaves that behind, and its checkpoint is as good as a paused one. Nothing detects a second harness on the same row: the row cannot tell a live harness from a dead one, and a liveness heuristic on `updated_at` would have to be told the pacing to be right. The operator runs one harness per database, and the partial unique index already holds one run per database.
+
+Every invocation ends by writing the row's status (`finished` at the end, `paused` otherwise, unless something outside already wrote it) and printing the summary.
+
+## The pause contract
+
+The harness pauses when the run row's status reads `paused`, whoever wrote it. That is the whole contract, and it is one field. The `pause` command writes it from another terminal now; a monitoring alert will write the same field later, and nothing alert-shaped exists until then.
+
+`run_replay` reads the status once per tick, after the pacing sleep and before the tick's posts, so nothing is posted once a pause is observed and a pause written while the loop sleeps costs at most that one tick (0.625 wall seconds at the default acceleration). The checkpoint a pause leaves behind is the last complete tick's, so a resume posts nothing twice. Proven against a real service: a poster double writes `paused` from a second connection mid-tick, the loop finishes that tick, checkpoints it, and stops with the status untouched; resuming from that row completes the run to a log identical to an uninterrupted one.
+
+Wall time spent paused never advances simulated time. The loop starts from the `sim_now` it is given and anchors its pacing schedule at that moment, so a run resumed a day later continues at the checkpoint with the next tick one simulated hour on, and the day off is not treated as a burst to catch up on. Tested with a fake wall clock jumped a day between two invocations.
+
+## Ctrl-C
+
+The first Ctrl-C asks the loop to pause. A signal handler installed for the length of the run sets a flag the loop reads where it reads the row's status, so the tick in progress finishes its posts and is checkpointed before the process exits, and the row is marked `paused`. Nothing is re-posted on resume. The alternative, letting `KeyboardInterrupt` propagate at once, was rejected because every Ctrl-C would then leave a re-post overlap in the wall-clock record for no gain: at one simulated hour per tick the wait is under a second.
+
+The handler steps aside as soon as it has fired, so a second Ctrl-C reaches Python's own handler and the process dies at once. The last checkpoint stands, the row still says `running`, and `resume` re-posts the partial tick, which the service answers as no-ops; that path is the killed-and-restarted arm of the byte-identity test.
+
+## Notifications
+
+Every pause and every finish sends a desktop notification: on macOS one `osascript -e 'display notification ...'` call through `subprocess`, with the text quoted through `json.dumps`, no new dependency. Anywhere else the notifier prints the text to stderr, so a run on a CI box or a Linux host records the pause all the same. A notification that fails to display never fails the run; the row and the printed summary are the record. The notifier is a value the commands take, and the tests assert the call and its text through an injected double; no test touches a real desktop.
+
+## Byte identity across a pause
+
+`tests/test_replay_resume_postgres.py` is the proof for the exit criterion. Three arms run the synthetic skew population at max speed against an in-process service, each over its own throwaway database: straight through; paused at a chosen simulated instant and resumed from the row; killed after a chosen number of posts, before that tick's checkpoint, and restarted from the row. The pause points are the tick before the first event, the tick containing it, mid-stream, the tick before a discharge, the tick containing it, the tick containing the last event, and the instant a label would be released (a discharge plus 30 simulated days). The kill points are zero posts, one, mid-stream, one short of a discharge, just after it, and after the last. Every arm's log must equal the straight arm's row for row, the paused arm's two invocations must cover the stream exactly once between them, and the killed arm's overlap must be exactly the uncheckpointed tick, every repeat acknowledged unscored.
+
+`prediction_id` and `scored_at` are excluded, for the reason the restart check recorded: the database assigns both, and a bigserial consumes a value even when the log's conflict clause drops a re-post. The labels table does not exist yet; the labels substep adds it to the same comparison at the same points, which is why the label-release instant is already one of them.
+
+`tests/test_replay_main_postgres.py` runs the commands themselves, as typed, from a throwaway repo root: `start` to the end, `start` refused while a run is open, `pause` honored at the next tick, Ctrl-C (a real `SIGINT` raised from inside a post) finishing the tick and marking the row, `resume` completing both a paused run and one whose process died, and `status`.
+
+`scripts/check_replay_resume.py` is the same comparison against the Compose stack and real data, which is local-only and cannot run in CI. It writes a seeded sample of patients as its own export, runs `start` straight through against one throwaway database, then against another runs `start` as a subprocess, sends it `SIGINT` once the log holds a prediction, checks the row says `paused` with the clock inside the span, and runs `resume`. Run on 2026-09-05 over 25 sampled baseline patients (seed 20260101) across the default span: the interrupted arm paused at `2025-01-10T16:00:00Z` with one prediction logged, resumed, and the two logs matched on all 15 predictions; the whole check took a minute and a half, most of it the container builds.
 
 ## Where the harness runs
 

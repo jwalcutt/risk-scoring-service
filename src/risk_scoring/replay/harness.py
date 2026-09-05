@@ -24,10 +24,22 @@ Judgment calls this module fixes:
 - Only clinical events are posted. The preload loads every patient row,
   so demographics are already in state before the first tick; a splice
   has to keep that true for the population it brings in.
+- A pause request is read once per iteration, after the pacing sleep and
+  before the tick's posts. Nothing is posted once a pause is observed, a
+  pause written while the loop sleeps costs at most that one tick, and
+  the checkpoint the pause leaves behind is the last complete tick's.
+  Whoever asked for the pause (an operator's Ctrl-C, the run row's
+  status, a monitoring alert one day) is not this module's concern; the
+  request is a value the loop takes.
+- Wall time spent paused never advances simulated time, because the loop
+  starts from the ``sim_now`` it is given and anchors its pacing schedule
+  when it starts. A resumed run continues from the checkpoint whatever
+  the wall clock did meanwhile.
 - The loop takes its poster, its checkpoint, its clock, and its sleep as
   values, so the tick-size and jumping-clock tests need neither Postgres
   nor a real clock. :func:`run_replay` is the one place the loop is bound
-  to a run row.
+  to a run row; it reads the row's status as the pause request and never
+  writes it.
 """
 
 from __future__ import annotations
@@ -58,6 +70,13 @@ Checkpoint = Callable[[datetime, StreamCursor | None], None]
 
 Sleep = Callable[[float], None]
 
+PauseRequested = Callable[[datetime], bool]
+"""Asked with the current ``sim_now`` before each tick's posts; true stops the loop."""
+
+
+def never(sim_now: datetime) -> bool:
+    return False
+
 
 @dataclass(frozen=True)
 class RunSummary:
@@ -71,6 +90,7 @@ class RunSummary:
     ticks: int
     wall_seconds: float
     largest_tick_gap_seconds: float
+    paused: bool = False
 
     @property
     def finished(self) -> bool:
@@ -89,12 +109,14 @@ def drive(
     wall_clock: clock.WallClock = clock.DEFAULT_WALL_CLOCK,
     sleep: Sleep = time.sleep,
     tick: timedelta = clock.TICK,
+    pause_requested: PauseRequested = never,
 ) -> RunSummary:
     """Tick from ``sim_now`` to ``end_at``, posting what falls due along the way.
 
     ``events`` is the stream to post, in stream order, already restricted
     to what the replay owns. ``cursor`` is the sort key of the last event
-    posted, or ``None`` at a fresh start.
+    posted, or ``None`` at a fresh start. The loop returns early, with the
+    summary marked paused, when ``pause_requested`` answers true.
     """
     sim_from = sim_now
     per_tick = pacing.wall_seconds_per_tick()
@@ -104,12 +126,16 @@ def drive(
     largest_gap = 0.0
     events_posted: dict[str, int] = {}
     discharges_scored = 0
+    paused = False
 
     while sim_now < end_at:
         due_wall = wall_anchor + (ticks + 1) * per_tick
         wait = due_wall - wall_clock()
         if wait > 0:
             sleep(wait)
+        if pause_requested(sim_now):
+            paused = True
+            break
 
         target = clock.next_tick(sim_now, end_at, tick=tick)
         for event in due_events(events, cursor, clock.instant(target)):
@@ -135,6 +161,7 @@ def drive(
         ticks=ticks,
         wall_seconds=wall_clock() - wall_anchor,
         largest_tick_gap_seconds=largest_gap,
+        paused=paused,
     )
 
 
@@ -147,16 +174,22 @@ def run_replay(
     pacing: clock.Pacing,
     wall_clock: clock.WallClock = clock.DEFAULT_WALL_CLOCK,
     sleep: Sleep = time.sleep,
+    pause_requested: PauseRequested = never,
 ) -> RunSummary:
     """Drive a run from where its row says it stands, checkpointing to that row.
 
     ``events`` is the population's whole ordered stream; only the events
     dated at or after the run's start are posted, the preload having put
-    the rest into state. The run's status is not touched here.
+    the rest into state. The run pauses when its row's status reads
+    ``paused``, whoever wrote it, or when ``pause_requested`` says so; the
+    status is read here, never written.
     """
 
     def checkpoint(sim_now: datetime, cursor: StreamCursor | None) -> None:
         runs.checkpoint(conn, run.run_id, sim_now=sim_now, cursor=cursor)
+
+    def pause(sim_now: datetime) -> bool:
+        return pause_requested(sim_now) or runs.read_status(conn, run.run_id) == "paused"
 
     return drive(
         replay_from(events, clock.instant(run.start_at)),
@@ -168,6 +201,7 @@ def run_replay(
         pacing=pacing,
         wall_clock=wall_clock,
         sleep=sleep,
+        pause_requested=pause,
     )
 
 
@@ -177,7 +211,8 @@ def report(summary: RunSummary) -> str:
         ", ".join(f"{count} {kind}" for kind, count in sorted(summary.events_posted.items()))
         or "none"
     )
-    standing = "finished" if summary.finished else f"stopped short of {_instant(summary.end_at)}"
+    # The loop returns only at the end or on a pause; a refusal raises.
+    standing = "finished" if summary.finished else f"paused at {_instant(summary.sim_to)}"
     span = f"{_instant(summary.sim_from)} to {_instant(summary.sim_to)}"
     return "\n".join(
         [

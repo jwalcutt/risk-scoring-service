@@ -25,28 +25,20 @@ import argparse
 import os
 import subprocess
 import sys
-import uuid
-from dataclasses import asdict
-from pathlib import Path
 from typing import Any
 
-import psycopg
-from psycopg import sql
-
-from risk_scoring import db as db_module
-from risk_scoring import predictions
+from compose_support import (
+    REPO_ROOT,
+    compare,
+    compose,
+    compose_env,
+    read_log,
+    throwaway_database,
+)
 from risk_scoring.populations import load_population
 from risk_scoring.sampling import sample_patients
 from risk_scoring.service_client import DEFAULT_SERVICE_PORT, ServiceClient
 from risk_scoring.stream import build_stream
-
-REPO_ROOT = Path(__file__).resolve().parent.parent
-
-VOLATILE_COLUMNS = ("prediction_id", "scored_at")
-
-
-def compose(arguments: list[str], env: dict[str, str]) -> None:
-    subprocess.run(["docker", "compose", *arguments], cwd=REPO_ROOT, env=env, check=True)
 
 
 def app_started_at(env: dict[str, str]) -> str:
@@ -69,39 +61,17 @@ def app_started_at(env: dict[str, str]) -> str:
     ).stdout.strip()
 
 
-def compose_env(*, database: str, port: int) -> dict[str, str]:
-    """Compose reads ${PWD} for the registry mounts, so it is set explicitly."""
-    sha = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, capture_output=True, text=True, check=False
-    )
-    return {
-        **os.environ,
-        "PWD": str(REPO_ROOT),
-        "SERVICE_DB": database,
-        "SERVICE_PORT": str(port),
-        "GIT_SHA": sha.stdout.strip() if sha.returncode == 0 else "",
-    }
-
-
-def read_log(url: str) -> list[dict[str, Any]]:
-    """The prediction log, minus the fields the database assigns."""
-    with psycopg.connect(url, connect_timeout=5) as conn:
-        rows = predictions.all_predictions(conn)
-    return [
-        {name: value for name, value in asdict(row).items() if name not in VOLATILE_COLUMNS}
-        for row in rows
-    ]
-
-
 def run_arm(
     events: list[dict[str, Any]], *, restart_at: int | None, port: int
 ) -> list[dict[str, Any]]:
     """Post the stream to the real stack against its own throwaway database."""
-    admin_url = db_module.database_url()
-    database = f"restart_check_{uuid.uuid4().hex[:12]}"
-    with psycopg.connect(admin_url, connect_timeout=5, autocommit=True) as admin:
-        admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database)))
-    url = psycopg.conninfo.make_conninfo(admin_url, dbname=database)
+    with throwaway_database("restart_check") as (database, url):
+        return _post(events, database=database, url=url, restart_at=restart_at, port=port)
+
+
+def _post(
+    events: list[dict[str, Any]], *, database: str, url: str, restart_at: int | None, port: int
+) -> list[dict[str, Any]]:
     env = compose_env(database=database, port=port)
     try:
         # The migrate service applies the schema to the new database before
@@ -127,19 +97,6 @@ def run_arm(
         return read_log(url)
     finally:
         compose(["stop", "app"], env)
-        with psycopg.connect(admin_url, connect_timeout=5, autocommit=True) as admin:
-            admin.execute(sql.SQL("DROP DATABASE {} WITH (FORCE)").format(sql.Identifier(database)))
-
-
-def compare(interrupted: list[dict[str, Any]], uninterrupted: list[dict[str, Any]]) -> str | None:
-    """None when the two logs agree, otherwise the first difference found."""
-    if len(interrupted) != len(uninterrupted):
-        return f"{len(interrupted)} rows after the restart, {len(uninterrupted)} without it"
-    for position, (left, right) in enumerate(zip(interrupted, uninterrupted, strict=True)):
-        if left != right:
-            differing = sorted(name for name in left if left[name] != right[name])
-            return f"row {position} ({left['encounter_id']}) differs on {differing}"
-    return None
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -173,7 +130,7 @@ def main(argv: list[str] | None = None) -> None:
     interrupted = run_arm(events, restart_at=restart_at, port=args.port)
     print(f"interrupted run:   {len(interrupted)} discharges scored")
 
-    difference = compare(interrupted, uninterrupted)
+    difference = compare(interrupted, uninterrupted, what="restart")
     if difference is not None:
         print(f"MISMATCH: {difference}")
         sys.exit(1)

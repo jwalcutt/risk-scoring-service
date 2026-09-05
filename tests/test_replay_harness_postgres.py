@@ -6,24 +6,22 @@ tests pin:
 
 - After a preload, a replay logs exactly what posting the same post-start
   events one at a time logs.
-- A run killed between a post and its checkpoint re-posts from the last
-  checkpoint on resume; the service answers the repeat as a no-op, and
-  the log is identical to an uninterrupted run. Idempotent ingestion is
-  what makes the per-tick checkpoint cheap, and this is the proof.
 - The run row ends at the end instant with the last posted event as its
   cursor, and the loop never touches the status.
 - Nothing dated before the start is posted or scored.
 - A refusal from the service stops the run with the checkpoint where the
   last complete tick left it.
+- The pause contract: when the run row's status becomes ``paused``,
+  whoever wrote it, the loop finishes the tick it is in, checkpoints, and
+  stops; resuming from that row completes the run to an identical log.
+
+The byte-identity matrix across pauses and kills is in
+``test_replay_resume_postgres.py``.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator, Mapping
-from contextlib import contextmanager
-from dataclasses import asdict
-from datetime import UTC, datetime
-from pathlib import Path
+from collections.abc import Callable, Mapping
 from typing import Any
 
 import pandas as pd
@@ -31,63 +29,35 @@ import psycopg
 import pytest
 from fastapi.testclient import TestClient
 
-from factories import write_skew_population
+from replay_support import (
+    END,
+    MAX_SPEED,
+    START,
+    ClientPoster,
+    Serve,
+    first_discharge_index,
+    prepare,
+    read_log,
+    serving,
+    skew_frames,
+    stream_of,
+    tick_containing,
+)
 from risk_scoring import predictions, train
-from risk_scoring.populations import load_population
 from risk_scoring.replay import clock, harness, preload, runs
-from risk_scoring.service.app import create_app
-from risk_scoring.service.config import ServiceConfig
-from risk_scoring.stream import StreamEvent, envelope, ordered_events
-from risk_scoring.train import MODEL_NAME
+from risk_scoring.stream import StreamEvent, envelope
 
 pytestmark = pytest.mark.db
-
-# Four cohort discharges fall before this start and six after it; the
-# population's last event is dated the day before this end.
-START = datetime(2024, 4, 1, tzinfo=UTC)
-END = datetime(2024, 8, 7, tzinfo=UTC)
-MAX_SPEED = clock.Pacing(acceleration=4, max_speed=True)
-
-# Assigned by the database, so they differ between two runs of one stream
-# by design and say nothing about whether the runs agree.
-_VOLATILE_COLUMNS = ("prediction_id", "scored_at")
-
-
-class KilledMidTick(RuntimeError):
-    """The harness process died after a post and before its checkpoint."""
-
-
-class ClientPoster:
-    """The poster the loop needs, backed by the FastAPI test client."""
-
-    def __init__(self, client: TestClient, *, die_after: int | None = None) -> None:
-        self.client = client
-        self.die_after = die_after
-        self.posted: list[Mapping[str, Any]] = []
-        self.acks: list[dict[str, Any]] = []
-
-    def post_event(self, event: Mapping[str, Any]) -> dict[str, Any]:
-        response = self.client.post("/events", json=event)
-        if response.status_code != 202:
-            raise RuntimeError(f"{event.get('event_type')} refused: {response.status_code}")
-        self.posted.append(event)
-        ack = dict(response.json())
-        self.acks.append(ack)
-        if self.die_after is not None and len(self.posted) == self.die_after:
-            raise KilledMidTick(f"died after {self.die_after} posts")
-        return ack
 
 
 @pytest.fixture(scope="module")
 def frames(tmp_path_factory: pytest.TempPathFactory) -> dict[str, pd.DataFrame]:
-    csv_dir = tmp_path_factory.mktemp("replay-population") / "csv"
-    write_skew_population(csv_dir)
-    return load_population(csv_dir)
+    return skew_frames(tmp_path_factory.mktemp("replay-population") / "csv")
 
 
 @pytest.fixture(scope="module")
 def events(frames: dict[str, pd.DataFrame]) -> list[StreamEvent]:
-    return ordered_events(frames["encounters"], frames["medications"], frames["conditions"])
+    return stream_of(frames)
 
 
 @pytest.fixture(scope="module")
@@ -97,57 +67,28 @@ def replayed(events: list[StreamEvent]) -> list[StreamEvent]:
 
 
 @pytest.fixture()
-def serve(trained_repo: tuple[Path, train.TrainingResult]) -> Callable[[str], Any]:
-    root, trained = trained_repo
-
-    @contextmanager
-    def instance(dsn: str) -> Iterator[TestClient]:
-        app = create_app(ServiceConfig(MODEL_NAME, trained.model_version), root, dsn)
-        with TestClient(app) as client:
-            yield client
-
-    return instance
-
-
-def _prepare(
-    dsn: str, frames: dict[str, pd.DataFrame], events: list[StreamEvent]
-) -> runs.ReplayRun:
-    """Preload history and open the run row, as the start command will."""
-    with psycopg.connect(dsn, connect_timeout=2) as conn:
-        preload.preload_history(conn, frames, events, clock.instant(START))
-        return runs.create_run(conn, population="skew", start_at=START, end_at=END, acceleration=4)
+def serve(trained_repo: tuple[Any, train.TrainingResult]) -> Serve:
+    return serving(trained_repo)
 
 
 def _replay(
-    serve: Callable[[str], Any],
+    serve: Serve,
     dsn: str,
     events: list[StreamEvent],
     *,
-    die_after: int | None = None,
-) -> tuple[harness.RunSummary | None, ClientPoster]:
+    make_poster: Callable[[TestClient], ClientPoster] = ClientPoster,
+) -> tuple[harness.RunSummary, ClientPoster]:
     """One invocation of the loop from wherever the run row stands."""
     with psycopg.connect(dsn, connect_timeout=2) as conn, serve(dsn) as client:
         run = runs.open_run(conn)
         assert run is not None
-        poster = ClientPoster(client, die_after=die_after)
-        try:
-            summary = harness.run_replay(conn, run, events, poster, pacing=MAX_SPEED)
-        except KilledMidTick:
-            return None, poster
+        poster = make_poster(client)
+        summary = harness.run_replay(conn, run, events, poster, pacing=MAX_SPEED)
         return summary, poster
 
 
-def _log(dsn: str) -> list[dict[str, Any]]:
-    with psycopg.connect(dsn, connect_timeout=2) as conn:
-        rows = predictions.all_predictions(conn)
-    return [
-        {name: value for name, value in asdict(row).items() if name not in _VOLATILE_COLUMNS}
-        for row in rows
-    ]
-
-
 def _per_event_reference(
-    serve: Callable[[str], Any],
+    serve: Serve,
     dsn: str,
     frames: dict[str, pd.DataFrame],
     events: list[StreamEvent],
@@ -160,7 +101,7 @@ def _per_event_reference(
         poster = ClientPoster(client)
         for event in replayed:
             poster.post_event(envelope(event.kind, event.row))
-    return _log(dsn)
+    return read_log(dsn)
 
 
 def test_the_fixture_replays_something_worth_comparing(replayed: list[StreamEvent]) -> None:
@@ -170,8 +111,8 @@ def test_the_fixture_replays_something_worth_comparing(replayed: list[StreamEven
 
 
 def test_a_replay_logs_what_per_event_posting_logs(
-    serve: Callable[[str], Any],
-    db_url_factory: Callable[[], str],
+    serve: Serve,
+    db_url_factory: Any,
     frames: dict[str, pd.DataFrame],
     events: list[StreamEvent],
     replayed: list[StreamEvent],
@@ -180,73 +121,24 @@ def test_a_replay_logs_what_per_event_posting_logs(
     replay_dsn = db_url_factory()
 
     reference = _per_event_reference(serve, reference_dsn, frames, events, replayed)
-    _prepare(replay_dsn, frames, events)
+    prepare(replay_dsn, frames, events)
     summary, poster = _replay(serve, replay_dsn, events)
 
-    assert summary is not None and summary.finished
-    assert _log(replay_dsn) == reference
+    assert summary.finished
+    assert read_log(replay_dsn) == reference
     assert len(reference) == 6
     assert summary.discharges_scored == 6
     assert len(poster.posted) == len(replayed)
 
 
-def _discharge_index(replayed: list[StreamEvent]) -> int:
-    for index, event in enumerate(replayed):
-        if event.kind == "encounter" and event.row["ENCOUNTERCLASS"] == "inpatient":
-            return index + 1
-    raise AssertionError("no inpatient discharge after the start")
-
-
-KILL_POINTS: list[Any] = [
-    pytest.param(lambda replayed: 1, id="after-the-first-post"),
-    pytest.param(_discharge_index, id="just-after-a-discharge"),
-    pytest.param(lambda replayed: len(replayed) // 2, id="mid-stream"),
-    pytest.param(lambda replayed: len(replayed), id="after-the-last-post"),
-]
-
-
-@pytest.mark.parametrize("choose_kill", KILL_POINTS)
-def test_a_run_killed_before_its_checkpoint_resumes_to_an_identical_log(
-    serve: Callable[[str], Any],
-    db_url_factory: Callable[[], str],
-    frames: dict[str, pd.DataFrame],
-    events: list[StreamEvent],
-    replayed: list[StreamEvent],
-    choose_kill: Callable[[list[StreamEvent]], int],
-) -> None:
-    uninterrupted_dsn = db_url_factory()
-    killed_dsn = db_url_factory()
-    die_after = choose_kill(replayed)
-
-    _prepare(uninterrupted_dsn, frames, events)
-    _replay(serve, uninterrupted_dsn, events)
-
-    _prepare(killed_dsn, frames, events)
-    _, first = _replay(serve, killed_dsn, events, die_after=die_after)
-    summary, second = _replay(serve, killed_dsn, events)
-
-    assert summary is not None and summary.finished
-    assert _log(killed_dsn) == _log(uninterrupted_dsn)
-    # The resume re-posts from the last checkpoint: the killed post, and
-    # whatever preceded it in the same tick. The service treats every
-    # repeat as nothing new, and the two invocations together cover the
-    # stream exactly once apart from that overlap.
-    re_posted = [event for event in second.posted if event in first.posted]
-    assert re_posted and first.posted[-1] in re_posted
-    assert first.posted[-len(re_posted) :] == re_posted == second.posted[: len(re_posted)]
-    assert all(ack["scored"] is False for ack in second.acks[: len(re_posted)])
-    expected = [envelope(event.kind, event.row) for event in replayed]
-    assert first.posted[: -len(re_posted)] + second.posted == expected
-
-
 def test_the_run_row_ends_at_the_end_with_the_last_event_as_its_cursor(
-    serve: Callable[[str], Any],
+    serve: Serve,
     db_url: str,
     frames: dict[str, pd.DataFrame],
     events: list[StreamEvent],
     replayed: list[StreamEvent],
 ) -> None:
-    created = _prepare(db_url, frames, events)
+    created = prepare(db_url, frames, events)
     _replay(serve, db_url, events)
 
     with psycopg.connect(db_url, connect_timeout=2) as conn:
@@ -257,13 +149,13 @@ def test_the_run_row_ends_at_the_end_with_the_last_event_as_its_cursor(
 
 
 def test_nothing_before_the_start_is_posted_or_scored(
-    serve: Callable[[str], Any],
+    serve: Serve,
     db_url: str,
     frames: dict[str, pd.DataFrame],
     events: list[StreamEvent],
     replayed: list[StreamEvent],
 ) -> None:
-    _prepare(db_url, frames, events)
+    prepare(db_url, frames, events)
     _, poster = _replay(serve, db_url, events)
 
     # Exactly the post-start events, no demographics, nothing from before.
@@ -275,7 +167,7 @@ def test_nothing_before_the_start_is_posted_or_scored(
 
 
 def test_a_refusal_stops_the_run_with_the_checkpoint_before_that_tick(
-    serve: Callable[[str], Any],
+    serve: Serve,
     db_url: str,
     events: list[StreamEvent],
     replayed: list[StreamEvent],
@@ -285,7 +177,7 @@ def test_a_refusal_stops_the_run_with_the_checkpoint_before_that_tick(
         created = runs.create_run(
             conn, population="skew", start_at=START, end_at=END, acceleration=4
         )
-    first_discharge = replayed[_discharge_index(replayed) - 1]
+    first_discharge = replayed[first_discharge_index(replayed) - 1]
 
     with pytest.raises(RuntimeError, match="refused"):
         _replay(serve, db_url, events)
@@ -295,3 +187,94 @@ def test_a_refusal_stops_the_run_with_the_checkpoint_before_that_tick(
     assert clock.instant(run.sim_now) < first_discharge.at
     assert run.cursor is None or run.cursor < first_discharge.sort_key
     assert run.status == "running"
+
+
+# The pause contract
+
+
+class PauseWriter(ClientPoster):
+    """Stands in for whoever writes ``paused`` to the run row mid-run.
+
+    After ``pause_after`` posts it opens its own connection and writes the
+    status, as an operator's ``pause`` command or a monitoring alert
+    would, from outside the harness process.
+    """
+
+    def __init__(self, client: TestClient, *, dsn: str, pause_after: int) -> None:
+        super().__init__(client)
+        self.dsn = dsn
+        self.pause_after = pause_after
+
+    def post_event(self, event: Mapping[str, Any]) -> dict[str, Any]:
+        ack = super().post_event(event)
+        if len(self.posted) == self.pause_after:
+            with psycopg.connect(self.dsn, connect_timeout=2) as conn:
+                run = runs.open_run(conn)
+                assert run is not None
+                runs.set_status(conn, run.run_id, "paused")
+        return ack
+
+
+def test_the_harness_pauses_when_the_run_row_says_so_and_checkpoints_the_tick(
+    serve: Serve,
+    db_url_factory: Any,
+    frames: dict[str, pd.DataFrame],
+    events: list[StreamEvent],
+    replayed: list[StreamEvent],
+) -> None:
+    """The field is written from outside mid-tick; the loop stops at that tick's end."""
+    straight_dsn = db_url_factory()
+    paused_dsn = db_url_factory()
+    pause_after = len(replayed) // 2
+    paused_tick = tick_containing(replayed[pause_after - 1].at)
+    in_that_tick = [event for event in replayed if event.at <= clock.instant(paused_tick)]
+
+    prepare(straight_dsn, frames, events)
+    _replay(serve, straight_dsn, events)
+
+    created = prepare(paused_dsn, frames, events)
+    summary, poster = _replay(
+        serve,
+        paused_dsn,
+        events,
+        make_poster=lambda client: PauseWriter(client, dsn=paused_dsn, pause_after=pause_after),
+    )
+
+    # Stopped within the tick: every event due in it was posted, none after.
+    assert summary.paused and not summary.finished
+    assert summary.sim_to == paused_tick
+    assert poster.posted == [envelope(event.kind, event.row) for event in in_that_tick]
+    assert len(in_that_tick) < len(replayed)
+    with psycopg.connect(paused_dsn, connect_timeout=2) as conn:
+        run = runs.read_run(conn, created.run_id)
+    assert run.sim_now == paused_tick
+    assert run.cursor == in_that_tick[-1].sort_key
+    # The loop reads the status and never writes it.
+    assert run.status == "paused"
+
+    with psycopg.connect(paused_dsn, connect_timeout=2) as conn:
+        runs.set_status(conn, created.run_id, "running")
+    resumed, second = _replay(serve, paused_dsn, events)
+    assert resumed.finished
+    assert read_log(paused_dsn) == read_log(straight_dsn)
+    assert poster.posted + second.posted == [envelope(event.kind, event.row) for event in replayed]
+
+
+def test_a_run_that_starts_paused_posts_nothing(
+    serve: Serve,
+    db_url: str,
+    frames: dict[str, pd.DataFrame],
+    events: list[StreamEvent],
+) -> None:
+    created = prepare(db_url, frames, events)
+    with psycopg.connect(db_url, connect_timeout=2) as conn:
+        runs.set_status(conn, created.run_id, "paused")
+
+    summary, poster = _replay(serve, db_url, events)
+
+    assert summary.paused
+    assert summary.ticks == 0
+    assert poster.posted == []
+    with psycopg.connect(db_url, connect_timeout=2) as conn:
+        run = runs.read_run(conn, created.run_id)
+    assert run.sim_now == START and run.cursor is None
