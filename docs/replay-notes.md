@@ -63,6 +63,20 @@ The baseline's pre-start volume is about 1.7 million rows (712,833 encounters, 5
 
 Verified on the synthetic skew population in CI: after a preload, per-patient state read back byte-identical to per-event ingestion of the same rows, nothing dated at or after the start was in state, no prediction had been written, and a second preload loaded nothing new.
 
+## The tick loop
+
+`risk_scoring.replay.harness` is the loop. Each tick advances `sim_now` by one step, posts every event due at or before it through the service's existing contract, then writes the clock and the cursor to the run row. `risk_scoring.replay.emission.due_events` decides what is due: the events whose sort key is after the cursor and whose arrival instant is at or before the tick's instant, in stream order. The resume point is found by bisection over the stream's sort keys, so a stream rebuilt from the export, or spliced so that different rows precede the cursor, resumes at the same next event, and a year of hourly ticks does not scan the stream from the top each time.
+
+What the loop posts is a function of the stream and simulated time only. `tests/test_replay_harness.py` drives it with no database and no real clock and asserts that one-hour and seven-day ticks post the identical sequence, that a wall clock jumping forward a week mid-run posts the identical sequence, and that pacing shows up only as time asked of `sleep`. `next_tick` takes the step as an argument for that test alone; production passes the constant.
+
+Pacing is a schedule anchored when the loop starts, not a fixed sleep per tick. Tick `n` is due `n` tick-lengths of wall time after the anchor, and the loop sleeps only while it is ahead of that schedule. A fixed sleep was the alternative and was rejected because it could never produce the burst the wall-clock decision describes: after the machine sleeps, `time.time()` is far ahead of the schedule, so the loop runs ticks back to back with no waiting until it has caught up, and the burst lands in `scored_at` as the outage record.
+
+The checkpoint is written after the tick's posts, never before. A refusal from the service propagates unchanged, so a 4xx stops the run rather than being counted and skipped; because the tick was never checkpointed, the next invocation re-posts it from the last checkpoint, and the service answers what it has already stored as a no-op. `tests/test_replay_harness_postgres.py` proves that against a real service: a run killed after a post and before its checkpoint, then resumed from the run row, re-posts the killed tick, every repeat comes back unscored, and the prediction log equals an uninterrupted run's row for row. The same file shows a replay after a preload logging exactly what posting the post-start events one at a time logs. The comparisons exclude `prediction_id` and `scored_at`, which the database assigns and which differ between two runs of one stream by design.
+
+Only clinical events are posted. The preload loads every patient row, so demographics are in state before the first tick, and the harness stream is `preload.replay_from`, the exact complement of what the preload took. A splice has to keep that true for the population it brings in.
+
+The run summary an invocation returns covers the simulated span it advanced, events posted by kind, discharges scored as the service acknowledged them, ticks, wall time, and the largest wall gap between consecutive ticks. Label counts are not on it yet: a field that always reads zero would misdescribe a run, so the labels substep adds those fields when it adds the numbers. `harness.report` renders the summary as text for the commands that arrive next; the loop itself does not touch the run's status, and pause, resume, and the commands are that substep's work.
+
 ## Where the harness runs
 
 The harness is a host process, `python -m risk_scoring.replay`, reading the local population export and posting to the Compose service. A fourth Compose service with `data/` mounted was the alternative. The data is local-only by design and the pause notification needs the desktop, so the host is where both already are.
