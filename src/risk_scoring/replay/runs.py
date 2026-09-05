@@ -118,6 +118,19 @@ def read_run(conn: psycopg.Connection[Any], run_id: int) -> ReplayRun:
     return _stored(row)
 
 
+def read_status(conn: psycopg.Connection[Any], run_id: int) -> str:
+    """One run's status; read-only. Raises LookupError if there is none.
+
+    The tick loop asks this once per tick, so it reads the one column it
+    needs rather than the whole row.
+    """
+    row = conn.execute("SELECT status FROM replay_runs WHERE run_id = %s", [run_id]).fetchone()
+    if row is None:
+        raise LookupError(f"no replay run with id {run_id}")
+    status: str = row[0]
+    return status
+
+
 def checkpoint(
     conn: psycopg.Connection[Any],
     run_id: int,

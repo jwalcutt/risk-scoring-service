@@ -12,11 +12,14 @@ what reaches the service or in what order. The rules these tests pin:
 - Each tick's checkpoint is written after that tick's posts, and a
   refusal from the service leaves the checkpoint where the last complete
   tick put it.
+- A pause request is honored before a tick's posts, and wall time spent
+  paused never advances simulated time: the resumed loop continues from
+  the checkpoint's ``sim_now`` whatever the wall clock did meanwhile.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -129,10 +132,14 @@ def _drive(
     tick: timedelta = clock.TICK,
     sim_now: datetime = START,
     cursor: StreamCursor | None = None,
+    pause_requested: Callable[[datetime], bool] | None = None,
 ) -> tuple[harness.RunSummary, RecordingPoster, Checkpoints, FakeWall]:
     poster = RecordingPoster() if poster is None else poster
     checkpoint = Checkpoints() if checkpoint is None else checkpoint
     wall = FakeWall() if wall is None else wall
+    extra: dict[str, Any] = {}
+    if pause_requested is not None:
+        extra["pause_requested"] = pause_requested
     summary = harness.drive(
         events,
         sim_now=sim_now,
@@ -144,6 +151,7 @@ def _drive(
         wall_clock=wall,
         sleep=wall.sleep,
         tick=tick,
+        **extra,
     )
     return summary, poster, checkpoint, wall
 
@@ -272,6 +280,82 @@ def test_a_refusal_propagates_and_leaves_the_checkpoint_before_the_tick(
     assert checkpoints.written[-1] == (datetime(2025, 1, 3, 13, tzinfo=UTC), events[6].sort_key)
 
 
+# Pausing
+
+
+def test_a_pause_request_stops_the_loop_before_that_ticks_posts(
+    events: list[StreamEvent],
+) -> None:
+    """Nothing is posted once a pause is observed; the last checkpoint is the tick before."""
+    pause_at = datetime(2025, 1, 3, 13, tzinfo=UTC)  # the tick ending 14:00 holds two events
+    summary, poster, checkpoints, _ = _drive(
+        events, pause_requested=lambda sim_now: sim_now >= pause_at
+    )
+
+    assert summary.paused
+    assert not summary.finished
+    assert summary.sim_to == pause_at
+    assert checkpoints.written[-1] == (pause_at, events[6].sort_key)
+    assert poster.posted == [envelope(event.kind, event.row) for event in events[:7]]
+
+
+def test_a_pause_request_is_read_after_the_pacing_sleep(events: list[StreamEvent]) -> None:
+    """A pause written while the loop sleeps stops it without another tick's posts."""
+    wall = FakeWall()
+    asked: list[datetime] = []
+
+    def pause_requested(sim_now: datetime) -> bool:
+        asked.append(sim_now)
+        return len(wall.sleeps) == 2
+
+    summary, poster, checkpoints, _ = _drive(
+        events, pacing=PACED, wall=wall, pause_requested=pause_requested
+    )
+    assert len(wall.sleeps) == 2
+    assert summary.ticks == 1
+    assert asked == [START, START + clock.TICK]
+    assert checkpoints.written == [(START + clock.TICK, events[4].sort_key)]
+    assert poster.posted == [envelope(event.kind, event.row) for event in events[:5]]
+
+
+def test_wall_time_spent_paused_never_advances_simulated_time(
+    events: list[StreamEvent],
+) -> None:
+    """Pause, let a wall day pass, resume from the checkpoint: the clock restarts from it."""
+    _, reference, _, _ = _drive(events)
+    pause_at = datetime(2025, 1, 2, 6, tzinfo=UTC)
+    wall = FakeWall()
+
+    _, before, paused_at, _ = _drive(
+        events, pacing=PACED, wall=wall, pause_requested=lambda sim_now: sim_now >= pause_at
+    )
+    sim_now, cursor = paused_at.written[-1]
+    assert sim_now == pause_at
+
+    wall.now += 24 * 3600
+    second, after, resumed, _ = _drive(
+        events, pacing=PACED, wall=wall, sim_now=sim_now, cursor=cursor
+    )
+
+    assert resumed.written[0][0] == pause_at + clock.TICK
+    assert second.sim_from == pause_at
+    assert second.finished
+    assert before.posted + after.posted == reference.posted
+    # The paced sleeps resume at the full tick length: the anchor is reset,
+    # so the wall day off is not treated as a burst to catch up on.
+    assert resumed.written[0][0] - pause_at == clock.TICK
+    assert wall.sleeps[-1] == pytest.approx(PACED.wall_seconds_per_tick())
+
+
+def test_a_paused_summary_is_not_finished_and_a_finished_one_is_not_paused(
+    events: list[StreamEvent],
+) -> None:
+    finished, _, _, _ = _drive(events)
+    assert finished.finished and not finished.paused
+    paused, _, _, _ = _drive(events, pause_requested=lambda sim_now: sim_now > START)
+    assert paused.paused and not paused.finished
+
+
 # Pacing
 
 
@@ -334,3 +418,12 @@ def test_the_report_names_the_span_and_the_counts(events: list[StreamEvent]) -> 
     assert "5 encounter" in text
     assert "5 discharges scored" in text
     assert "2 ticks" in text
+    assert "finished" in text
+
+
+def test_the_report_names_a_pause(events: list[StreamEvent]) -> None:
+    pause_at = datetime(2025, 1, 2, 6, tzinfo=UTC)
+    summary, _, _, _ = _drive(events, pause_requested=lambda sim_now: sim_now >= pause_at)
+    text = harness.report(summary)
+    assert "paused at 2025-01-02T06:00:00Z" in text
+    assert "stopped short" not in text
