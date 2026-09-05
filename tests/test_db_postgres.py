@@ -21,6 +21,7 @@ EXPECTED_TABLES = {
     "medications",
     "conditions",
     "predictions",
+    "replay_runs",
 }
 
 

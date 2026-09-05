@@ -1,0 +1,23 @@
+# Replay configuration: which frozen population is streamed to the scoring
+# service, over which simulated span, and how fast. Committed so a replay is
+# reproducible from the repository alone. Every value can be overridden on
+# the command line; a test pins the defaults to the training cutoff and the
+# generation reference date so the three cannot drift apart.
+
+[replay]
+population = "baseline"
+# The training cutoff: every replayed discharge is held out from training.
+start = 2025-01-01
+# The generation reference date: where the data stops.
+end = 2026-01-01
+# Simulated days per wall minute. Four covers a simulated year in about
+# ninety attended minutes and matures a 30-day label in seven and a half.
+acceleration = 4
+
+# Stream splices: from `at`, the named population replaces the current
+# source of every event, and nothing before it changes. Entries must be
+# strictly increasing and lie strictly inside the run. None by default.
+#
+# [[splice]]
+# at = 2025-04-01
+# population = "care_protocol"
