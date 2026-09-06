@@ -1,8 +1,8 @@
 """Helpers shared by the replay tests that drive a real service.
 
-Three test files run the tick loop against an in-process service over a
-throwaway database: the harness tests, the byte-identity matrix across
-pauses and kills, and the command tests. They need the same synthetic
+The test files that run the tick loop against an in-process service over
+a throwaway database (the harness tests, the byte-identity matrix across
+pauses and kills, the label and splice proofs, and the command tests) They need the same synthetic
 population, the same poster over the test client, the same preparation
 of a run row, and the same view of the prediction log. Those live here so
 the files state their rules rather than their plumbing.
@@ -25,7 +25,7 @@ import pandas as pd
 import psycopg
 from fastapi.testclient import TestClient
 
-from factories import write_skew_population
+from factories import write_skew_population, write_splice_population
 from risk_scoring import label_log, predictions, train
 from risk_scoring.populations import load_population
 from risk_scoring.replay import clock, preload, release, runs
@@ -41,6 +41,12 @@ from risk_scoring.train import MODEL_NAME
 START = datetime(2024, 4, 1, tzinfo=UTC)
 END = datetime(2024, 8, 7, tzinfo=UTC)
 POPULATION = "skew"
+
+# Where the splice population takes over from the skew population: three
+# skew discharges fall before it and three after, and five of the splice
+# population's fall at or after it.
+SPLICE_AT = datetime(2024, 5, 10, tzinfo=UTC)
+SPLICE_POPULATION = "variant"
 
 MAX_SPEED = clock.Pacing(acceleration=4, max_speed=True)
 
@@ -96,6 +102,12 @@ def skew_frames(csv_dir: Path) -> dict[str, pd.DataFrame]:
     return load_population(csv_dir)
 
 
+def splice_frames(csv_dir: Path) -> dict[str, pd.DataFrame]:
+    """Write the splice population to ``csv_dir`` and read it back, ids as exported."""
+    write_splice_population(csv_dir)
+    return load_population(csv_dir)
+
+
 def stream_of(frames: Mapping[str, pd.DataFrame]) -> list[StreamEvent]:
     return ordered_events(frames["encounters"], frames["medications"], frames["conditions"])
 
@@ -128,6 +140,26 @@ def prepare(
     """Preload history and open the run row, as the start command does."""
     with psycopg.connect(dsn, connect_timeout=2) as conn:
         preload.preload_history(conn, frames, events, clock.instant(start))
+        return runs.create_run(
+            conn, population=POPULATION, start_at=start, end_at=end, acceleration=4
+        )
+
+
+Source = tuple[Mapping[str, pd.DataFrame], list[StreamEvent], datetime]
+"""One population's frames and stream, and the instant its history is loaded before."""
+
+
+def prepare_spliced(
+    dsn: str,
+    sources: list[Source],
+    *,
+    start: datetime = START,
+    end: datetime = END,
+) -> runs.ReplayRun:
+    """Preload each population's history before its instant, then open the row."""
+    with psycopg.connect(dsn, connect_timeout=2) as conn:
+        for frames, events, before in sources:
+            preload.preload_history(conn, frames, events, clock.instant(before))
         return runs.create_run(
             conn, population=POPULATION, start_at=start, end_at=end, acceleration=4
         )

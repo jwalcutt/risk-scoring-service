@@ -508,3 +508,90 @@ def write_skew_population(csv_dir: Path) -> int:
     write_rows_csv(csv_dir / "medications.csv", medications)
     write_rows_csv(csv_dir / "conditions.csv", conditions)
     return 10
+
+
+def write_splice_population(csv_dir: Path) -> int:
+    """The population a replay splices to, built against the skew population.
+
+    Designed for a splice at 2024-05-10T00:00:00Z in the skew population's
+    span (2024-04-01 to 2024-08-07). One patient reuses a skew id with a
+    different birthdate, the collision a module-variant export produces
+    in practice, so the two can share state only once this population's
+    ids are rewritten. Its stays cover: a pre-splice discharge that is
+    preloaded, never posted, and never labelled; an index discharge whose
+    180-day count and days-since-previous are right only if that history
+    reached state; a discharge at exactly the splice instant; a
+    readmission pair after the splice; and a discharge inside the final
+    30 days, so one label is pending. A medication and a condition lie on
+    each side of the splice so every event kind crosses it.
+
+    Returns the number of encounters the cohort rules admit after the
+    splice.
+    """
+    patients = [
+        make_patient_row(Id="p-fresh", BIRTHDATE="1958-03-03"),
+        make_patient_row(Id="p-b-boundary", BIRTHDATE="1965-01-01"),
+        make_patient_row(Id="p-b-readmit", BIRTHDATE="1950-06-06"),
+        make_patient_row(Id="p-b-late", BIRTHDATE="1972-02-02"),
+    ]
+
+    def stay(encounter_id: str, patient: str, start: str, stop: str) -> dict[str, str]:
+        return make_encounter_row(
+            Id=encounter_id, PATIENT=patient, ENCOUNTERCLASS="inpatient", START=start, STOP=stop
+        )
+
+    encounters = [
+        # History before the splice: preloaded, never posted, never labelled.
+        stay("e-b-prior", "p-fresh", "2024-04-16T08:00:00Z", "2024-04-20T08:00:00Z"),
+        # Admitted 38 days after e-b-prior: one prior inpatient stay in the window.
+        stay("e-b-index", "p-fresh", "2024-05-28T08:00:00Z", "2024-06-01T08:00:00Z"),
+        # Discharged at exactly the splice instant: this population's.
+        stay("e-b-boundary", "p-b-boundary", "2024-05-07T00:00:00Z", "2024-05-10T00:00:00Z"),
+        # A pre-splice stay readmitted after it, then a readmission pair.
+        stay("e-b-history", "p-b-readmit", "2024-05-02T08:00:00Z", "2024-05-08T08:00:00Z"),
+        stay("e-b-r1", "p-b-readmit", "2024-05-17T08:00:00Z", "2024-05-20T08:00:00Z"),
+        stay("e-b-r2", "p-b-readmit", "2024-06-05T08:00:00Z", "2024-06-08T08:00:00Z"),
+        # Inside the final 30 days: scored, label pending at the end.
+        stay("e-b-late", "p-b-late", "2024-07-29T08:00:00Z", "2024-08-01T08:00:00Z"),
+    ]
+    medications = [
+        make_medication_row(
+            PATIENT="p-fresh",
+            ENCOUNTER="e-b-prior",
+            CODE="308136",
+            START="2024-04-16T08:00:00Z",
+            STOP="2024-04-20T08:00:00Z",
+        ),
+        make_medication_row(
+            PATIENT="p-fresh",
+            ENCOUNTER="e-b-index",
+            CODE="310798",
+            START="2024-05-28T08:00:00Z",
+            STOP="",
+        ),
+    ]
+    conditions = [
+        make_condition_row(
+            PATIENT="p-fresh",
+            ENCOUNTER="e-b-prior",
+            CODE="444814009",
+            START="2024-04-16",
+            STOP="2024-04-30",
+            DESCRIPTION="Viral sinusitis (disorder)",
+        ),
+        make_condition_row(
+            PATIENT="p-fresh",
+            ENCOUNTER="e-b-index",
+            CODE="88805009",
+            START="2024-05-29",
+            STOP="",
+            DESCRIPTION="Chronic congestive heart failure (disorder)",
+        ),
+    ]
+
+    csv_dir.mkdir(parents=True, exist_ok=True)
+    write_rows_csv(csv_dir / "patients.csv", patients)
+    write_rows_csv(csv_dir / "encounters.csv", encounters)
+    write_rows_csv(csv_dir / "medications.csv", medications)
+    write_rows_csv(csv_dir / "conditions.csv", conditions)
+    return 5

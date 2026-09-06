@@ -16,6 +16,11 @@ with the service and the notifier injected. The rules these tests pin:
 - A run whose process died leaves ``running`` behind; ``resume`` takes it
   from the checkpoint all the same.
 - ``status`` prints the row.
+- ``start`` with a splice preloads every population's history before its
+  own instant and posts the incoming population from the splice on;
+  ``resume`` rebuilds the same spliced stream from the config it is given.
+  A splice naming a missing export is refused before anything is loaded,
+  and a splice outside the row's span is refused on resume.
 """
 
 from __future__ import annotations
@@ -35,34 +40,62 @@ import risk_scoring.replay.__main__ as replay_main
 from replay_support import (
     END,
     MAX_SPEED,
+    SPLICE_AT,
+    SPLICE_POPULATION,
     START,
     ClientPoster,
     KilledMidTick,
     Serve,
+    Source,
     prepare,
+    prepare_spliced,
     read_outputs,
     schedule_of,
     serving,
     skew_frames,
+    splice_frames,
     stream_of,
     tick_containing,
 )
 from risk_scoring import train
+from risk_scoring.populations import rekeyed
 from risk_scoring.replay import clock, harness, preload, runs
+from risk_scoring.replay.config import ReplayConfig, Splice
+from risk_scoring.replay.splice import (
+    segment_events,
+    segment_labels,
+    segments,
+    spliced_events,
+    spliced_labels,
+)
 from risk_scoring.stream import StreamEvent, envelope
 
 pytestmark = pytest.mark.db
 
 CONFIG = '[replay]\npopulation = "skew"\nstart = 2024-04-01\nend = 2024-08-07\nacceleration = 4\n'
+SPLICED = (
+    CONFIG
+    + f'\n[[splice]]\nat = {SPLICE_AT.date().isoformat()}\npopulation = "{SPLICE_POPULATION}"\n'
+)
+MISSING = CONFIG + f'\n[[splice]]\nat = {SPLICE_AT.date().isoformat()}\npopulation = "ghost"\n'
+# Valid on its own terms, so the refusal comes from the row's span, not the file's.
+STRANDED = (
+    CONFIG.replace("end = 2024-08-07", "end = 2025-01-01")
+    + f'\n[[splice]]\nat = 2024-09-01\npopulation = "{SPLICE_POPULATION}"\n'
+)
 
 
 @pytest.fixture(scope="module")
 def repo(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """A repo root with the config and the skew export where the commands look."""
+    """A repo root with the configs and the exports where the commands look."""
     root = tmp_path_factory.mktemp("replay-repo")
     (root / "configs").mkdir()
     (root / "configs" / "replay.toml").write_text(CONFIG)
+    (root / "configs" / "spliced.toml").write_text(SPLICED)
+    (root / "configs" / "missing.toml").write_text(MISSING)
+    (root / "configs" / "stranded.toml").write_text(STRANDED)
     skew_frames(root / "data" / "skew" / "csv")
+    splice_frames(root / "data" / SPLICE_POPULATION / "csv")
     return root
 
 
@@ -349,3 +382,136 @@ def test_resume_takes_a_run_whose_process_died_from_its_checkpoint(
     operator.run("resume")
     assert operator.row().status == "finished"
     assert read_outputs(operator.dsn) == reference
+
+
+# Splicing
+
+
+@pytest.fixture(scope="module")
+def spliced_sources(repo: Path, frames: dict[str, pd.DataFrame]) -> list[Source]:
+    incoming = rekeyed(splice_frames(repo / "data" / SPLICE_POPULATION / "csv"), SPLICE_POPULATION)
+    return [(frames, stream_of(frames), START), (incoming, stream_of(incoming), SPLICE_AT)]
+
+
+@pytest.fixture(scope="module")
+def spliced(spliced_sources: list[Source]) -> tuple[list[StreamEvent], list[Any]]:
+    """The spliced stream and schedule the commands must reproduce."""
+    config = ReplayConfig(
+        population="skew",
+        start=START.date(),
+        end=END.date(),
+        acceleration=4,
+        splices=(Splice(at=SPLICE_AT.date(), population=SPLICE_POPULATION),),
+    )
+    plan = segments(config)
+    events = spliced_events(
+        [segment_events(s, stream) for s, (_, stream, _) in zip(plan, spliced_sources, strict=True)]
+    )
+    labels = spliced_labels(
+        [
+            segment_labels(s, schedule_of(frames))
+            for s, (frames, _, _) in zip(plan, spliced_sources, strict=True)
+        ]
+    )
+    return events, labels
+
+
+def _straight_spliced(
+    serve: Serve, dsn: str, sources: list[Source], spliced: tuple[list[StreamEvent], list[Any]]
+) -> dict[str, list[dict[str, Any]]]:
+    events, labels = spliced
+    prepare_spliced(dsn, sources)
+    with psycopg.connect(dsn, connect_timeout=2) as conn, serve(dsn) as client:
+        run = runs.open_run(conn)
+        assert run is not None
+        harness.run_replay(conn, run, events, ClientPoster(client), labels=labels, pacing=MAX_SPEED)
+    outputs = read_outputs(dsn)
+    assert len(outputs["predictions"]) == 8 and len(outputs["labels"]) == 7
+    return outputs
+
+
+def test_start_with_a_splice_preloads_both_populations_and_posts_the_incoming_after_it(
+    operate: Callable[[str], Operator],
+    db_url_factory: Callable[[], str],
+    serve: Serve,
+    spliced_sources: list[Source],
+    spliced: tuple[list[StreamEvent], list[Any]],
+) -> None:
+    reference = _straight_spliced(serve, db_url_factory(), spliced_sources, spliced)
+    operator = operate(db_url_factory())
+
+    out = operator.run("start", "--config", "configs/spliced.toml")
+
+    events, _ = spliced
+    assert operator.row().status == "finished"
+    assert read_outputs(operator.dsn) == reference
+    assert operator.posted() == _expected(events)
+    assert f"history from skew before {clock.instant(START)}" in out
+    assert f"history from {SPLICE_POPULATION} before {clock.instant(SPLICE_AT)}" in out
+    before = sum(event.at < clock.instant(SPLICE_AT) for event in events)
+    assert f"{before} events from skew" in out
+    assert f"{len(events) - before} events from {SPLICE_POPULATION}" in out
+    assert "8 discharges scored" in out
+    assert "7 labels released, 1 pending" in out
+
+
+def test_resume_rebuilds_the_spliced_stream_from_the_config_it_is_given(
+    operate: Callable[[str], Operator],
+    db_url_factory: Callable[[], str],
+    serve: Serve,
+    spliced_sources: list[Source],
+    spliced: tuple[list[StreamEvent], list[Any]],
+) -> None:
+    reference = _straight_spliced(serve, db_url_factory(), spliced_sources, spliced)
+    operator = operate(db_url_factory())
+    events, _ = spliced
+    pause_after = sum(event.at < clock.instant(SPLICE_AT) for event in events) - 1
+
+    class PausesFromOutside(ClientPoster):
+        def post_event(self, event: Mapping[str, Any]) -> dict[str, Any]:
+            ack = super().post_event(event)
+            if len(self.posted) == pause_after:
+                with psycopg.connect(operator.dsn, connect_timeout=2) as conn:
+                    run = runs.open_run(conn)
+                    assert run is not None
+                    runs.set_status(conn, run.run_id, "paused")
+            return ack
+
+    operator.make_poster = PausesFromOutside
+    operator.run("start", "--config", "configs/spliced.toml")
+    assert operator.row().status == "paused"
+    assert operator.row().sim_now < SPLICE_AT
+
+    operator.make_poster = ClientPoster
+    operator.run("resume", "--config", "configs/spliced.toml")
+
+    assert operator.row().status == "finished"
+    assert read_outputs(operator.dsn) == reference
+    assert operator.posted() == _expected(events)
+
+
+def test_start_with_a_splice_naming_a_missing_export_is_refused_before_loading(
+    operate: Callable[[str], Operator], db_url: str
+) -> None:
+    operator = operate(db_url)
+    with pytest.raises(SystemExit, match="no CSV export"):
+        operator.run("start", "--config", "configs/missing.toml")
+
+    with psycopg.connect(db_url, connect_timeout=2) as conn:
+        assert conn.execute("SELECT count(*) FROM patients").fetchone() == (0,)
+        assert runs.open_run(conn) is None
+    assert operator.posters == []
+
+
+def test_resume_refuses_a_splice_outside_the_rows_span(
+    operate: Callable[[str], Operator], db_url: str
+) -> None:
+    operator = operate(db_url)
+    with psycopg.connect(db_url, connect_timeout=2) as conn:
+        runs.create_run(conn, population="skew", start_at=START, end_at=END, acceleration=4)
+
+    with pytest.raises(SystemExit, match="strictly inside"):
+        operator.run("resume", "--config", "configs/stranded.toml")
+
+    assert operator.row().status == "running"
+    assert operator.posters == []
