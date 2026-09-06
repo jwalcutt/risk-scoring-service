@@ -112,6 +112,20 @@ def test_empty_population_yields_no_events() -> None:
     assert ordered_events(*_frames([], [], [])) == []
 
 
+def test_an_event_carries_every_source_column_as_a_string() -> None:
+    """The tie-break sorts the whole row, so a projected row would reorder ties silently."""
+    encounter = make_encounter_row(Id="e1")
+    medication = make_medication_row(ENCOUNTER="e1")
+    condition = make_condition_row(ENCOUNTER="e1")
+    frames = _frames([encounter], [medication], [condition])
+    by_kind = {event.kind: event.row for event in ordered_events(*frames)}
+    assert list(by_kind["encounter"]) == list(frames[0].columns)
+    assert list(by_kind["medication"]) == list(frames[1].columns)
+    assert list(by_kind["condition"]) == list(frames[2].columns)
+    assert by_kind["encounter"] == encounter
+    assert all(isinstance(value, str) for row in by_kind.values() for value in row.values())
+
+
 # Payload projection
 
 
