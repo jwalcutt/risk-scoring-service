@@ -23,7 +23,7 @@ import psycopg
 from psycopg import sql
 
 from risk_scoring import db as db_module
-from risk_scoring import predictions
+from risk_scoring import label_log, predictions
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -31,6 +31,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # log's conflict clause drops a re-post, so ids gap after a resume by
 # design and say nothing about whether the two runs agree.
 VOLATILE_COLUMNS = ("prediction_id", "scored_at")
+
+# The labels table's equivalents: its own bigserial, the wall clock at
+# write, and the prediction id the log assigned.
+LABEL_VOLATILE_COLUMNS = ("label_id", "prediction_id", "recorded_at")
 
 
 def compose(arguments: list[str], env: dict[str, str]) -> None:
@@ -75,6 +79,16 @@ def read_log(url: str) -> list[dict[str, Any]]:
         rows = predictions.all_predictions(conn)
     return [
         {name: value for name, value in asdict(row).items() if name not in VOLATILE_COLUMNS}
+        for row in rows
+    ]
+
+
+def read_labels(url: str) -> list[dict[str, Any]]:
+    """The labels table, minus the fields the database assigns."""
+    with psycopg.connect(url, connect_timeout=5) as conn:
+        rows = label_log.all_labels(conn)
+    return [
+        {name: value for name, value in asdict(row).items() if name not in LABEL_VOLATILE_COLUMNS}
         for row in rows
     ]
 

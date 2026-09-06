@@ -39,12 +39,14 @@ from typing import Any
 
 import pandas as pd
 import psycopg
+from psycopg import sql
 
 from compose_support import (
     REPO_ROOT,
     compare,
     compose,
     compose_env,
+    read_labels,
     read_log,
     throwaway_database,
 )
@@ -106,10 +108,20 @@ def wait_for(process: subprocess.Popen[bytes], what: str) -> None:
         raise RuntimeError(f"{what} exited with status {code}")
 
 
-def count_predictions(url: str) -> int:
+def count_rows(url: str, table: str) -> int:
     with psycopg.connect(url, connect_timeout=5) as conn:
-        row = conn.execute("SELECT count(*) FROM predictions").fetchone()
+        row = conn.execute(
+            sql.SQL("SELECT count(*) FROM {}").format(sql.Identifier(table))
+        ).fetchone()
     return int(row[0]) if row is not None else 0
+
+
+Outputs = tuple[list[dict[str, Any]], list[dict[str, Any]]]
+"""The prediction log and the labels table, each minus what the database assigns."""
+
+
+def read_outputs(url: str) -> Outputs:
+    return read_log(url), read_labels(url)
 
 
 def open_run(url: str) -> runs.ReplayRun:
@@ -120,25 +132,30 @@ def open_run(url: str) -> runs.ReplayRun:
     return run
 
 
-def straight_arm(port: int, **settings: Any) -> list[dict[str, Any]]:
+def straight_arm(port: int, **settings: Any) -> Outputs:
     with throwaway_database("replay_check") as (database, url):
         env = compose_env(database=database, port=port)
         try:
             compose(["up", "-d", "--build"], env)
             wait_for(replay("start", url=url, port=port, **settings), "start")
-            return read_log(url)
+            return read_outputs(url)
         finally:
             compose(["stop", "app"], env)
 
 
-def interrupted_arm(port: int, **settings: Any) -> tuple[list[dict[str, Any]], runs.ReplayRun]:
-    """Start, interrupt once something is logged, check the row, resume."""
+def interrupted_arm(port: int, **settings: Any) -> tuple[Outputs, runs.ReplayRun]:
+    """Start, interrupt once a label has been released, check the row, resume.
+
+    Waiting for a label rather than a prediction puts the pause 30
+    simulated days into the run at the earliest, so the resumed
+    invocation has to continue a label stream already under way.
+    """
     with throwaway_database("replay_check") as (database, url):
         env = compose_env(database=database, port=port)
         try:
             compose(["up", "-d", "--build"], env)
             started = replay("start", url=url, port=port, **settings)
-            while started.poll() is None and count_predictions(url) == 0:
+            while started.poll() is None and count_rows(url, "labels") == 0:
                 time.sleep(POLL_SECONDS)
             if started.poll() is not None:
                 raise RuntimeError(
@@ -155,11 +172,12 @@ def interrupted_arm(port: int, **settings: Any) -> tuple[list[dict[str, Any]], r
                 raise RuntimeError(f"paused with the clock at {paused.sim_now}, not inside the run")
             print(
                 f"paused at {clock.instant(paused.sim_now)} with"
-                f" {count_predictions(url)} predictions logged"
+                f" {count_rows(url, 'predictions')} predictions logged"
+                f" and {count_rows(url, 'labels')} labels released"
             )
 
             wait_for(replay("resume", url=url, port=port, **settings), "resume")
-            return read_log(url), paused
+            return read_outputs(url), paused
         finally:
             compose(["stop", "app"], env)
 
@@ -209,21 +227,31 @@ def main(argv: list[str] | None = None) -> None:
             f" replaying {start} to {end}"
         )
 
-        straight = straight_arm(args.port, **settings)
-        print(f"straight run:    {len(straight)} discharges scored")
-        resumed, paused = interrupted_arm(args.port, **settings)
-        print(f"interrupted run: {len(resumed)} discharges scored")
+        straight_log, straight_labels = straight_arm(args.port, **settings)
+        print(
+            f"straight run:    {len(straight_log)} discharges scored,"
+            f" {len(straight_labels)} labels released"
+        )
+        (resumed_log, resumed_labels), paused = interrupted_arm(args.port, **settings)
+        print(
+            f"interrupted run: {len(resumed_log)} discharges scored,"
+            f" {len(resumed_labels)} labels released"
+        )
 
-    difference = compare(resumed, straight, what="pause")
-    if difference is not None:
-        print(f"MISMATCH: {difference}")
-        sys.exit(1)
-    if not straight:
-        print("MISMATCH: both runs scored nothing, so the comparison proves nothing")
+    for what, resumed, straight in (
+        ("predictions", resumed_log, straight_log),
+        ("labels", resumed_labels, straight_labels),
+    ):
+        difference = compare(resumed, straight, what="pause")
+        if difference is not None:
+            print(f"MISMATCH in {what}: {difference}")
+            sys.exit(1)
+    if not straight_log or not straight_labels:
+        print("MISMATCH: a run with nothing scored or nothing labelled proves nothing")
         sys.exit(1)
     print(
-        f"MATCH: {len(resumed)} predictions identical across a pause at"
-        f" {clock.instant(paused.sim_now)}"
+        f"MATCH: {len(resumed_log)} predictions and {len(resumed_labels)} labels identical"
+        f" across a pause at {clock.instant(paused.sim_now)}"
     )
 
 
