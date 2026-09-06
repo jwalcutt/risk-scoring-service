@@ -23,7 +23,7 @@ The cursor is the stream's own three-part sort key (arrival instant, kind order,
 
 A partial unique index allows at most one row whose status is not `finished`. The prediction log is unique per encounter, so one database can host one scoring run at a time anyway; the index makes `resume` and `status` with no arguments unambiguous, and lets monitoring find the current run without being told its id. Starting a second run while one is open raises `OpenRunError` and names the remedy.
 
-Deliberately absent from the row: tick size and max-speed mode, because pacing must not change what a run writes and so belongs to a process invocation, not to the run; and the splice list, which is plain data in the config file until stream splicing needs more.
+Deliberately absent from the row: tick size and max-speed mode, because pacing must not change what a run writes and so belongs to a process invocation, not to the run; and the splice list, which stays in the config file so that the date of a scheduled change never sits in a table anyone can read (see "Stream splicing").
 
 `risk_scoring.replay.runs` is the only writer. Each of `create_run`, `checkpoint`, and `set_status` commits on its own, matching the state layer and the log: a checkpoint that a later failure could roll back would let the harness re-post from a point earlier than the one it reported.
 
@@ -73,7 +73,7 @@ Pacing is a schedule anchored when the loop starts, not a fixed sleep per tick. 
 
 The checkpoint is written after the tick's posts, never before. A refusal from the service propagates unchanged, so a 4xx stops the run rather than being counted and skipped; because the tick was never checkpointed, the next invocation re-posts it from the last checkpoint, and the service answers what it has already stored as a no-op. `tests/test_replay_harness_postgres.py` proves that against a real service: a run killed after a post and before its checkpoint, then resumed from the run row, re-posts the killed tick, every repeat comes back unscored, and the prediction log equals an uninterrupted run's row for row. The same file shows a replay after a preload logging exactly what posting the post-start events one at a time logs. The comparisons exclude `prediction_id` and `scored_at`, which the database assigns and which differ between two runs of one stream by design.
 
-Only clinical events are posted. The preload loads every patient row, so demographics are in state before the first tick, and the harness stream is `preload.replay_from`, the exact complement of what the preload took. A splice has to keep that true for the population it brings in.
+Only clinical events are posted. The preload loads every patient row, so demographics are in state before the first tick, and the harness stream is `preload.replay_from`, the exact complement of what the preload took. A splice keeps that true for the population it brings in by preloading that population's history before its own splice instant, the same partition at a different boundary.
 
 The run summary an invocation returns covers the simulated span it advanced, events posted by kind, discharges scored as the service acknowledged them, labels released and labels pending, ticks, wall time, the largest wall gap between consecutive ticks, and whether it stopped on a pause. The summary describes one invocation, not the whole run. Counters accumulated on the run row were considered and rejected: they would need a migration to duplicate what the prediction log and the row's wall timestamps already hold. `harness.report` renders the summary as text; the loop itself reads the run's status and never writes it.
 
@@ -170,6 +170,58 @@ Every pause and every finish sends a desktop notification: on macOS one `osascri
 `tests/test_replay_main_postgres.py` runs the commands themselves, as typed, from a throwaway repo root: `start` to the end, `start` refused while a run is open, `pause` honored at the next tick, Ctrl-C (a real `SIGINT` raised from inside a post) finishing the tick and marking the row, `resume` completing both a paused run and one whose process died, and `status`.
 
 `scripts/check_replay_resume.py` is the same comparison against the Compose stack and real data, which is local-only and cannot run in CI. It writes a seeded sample of patients as its own export, runs `start` straight through against one throwaway database, then against another runs `start` as a subprocess, sends it `SIGINT` once the labels table holds a row, checks the row says `paused` with the clock inside the span, and runs `resume`. It compares the prediction log and the labels table separately and names the table on a mismatch. Waiting for a label rather than a prediction puts the pause at least 30 simulated days in, so the resumed invocation has to continue a label stream already under way; the earlier version paused on the first prediction, which was always before any label could be due and so proved nothing about them. Run on 2026-09-05 over 25 sampled baseline patients (seed 20260101) across the default span, after the labels table existed: the interrupted arm paused at `2025-02-10T06:00:00Z` with 3 predictions logged and 1 label released, resumed, and the two runs matched on all 15 predictions and all 14 labels, the fifteenth discharge being inside the final 30 days; the whole check took about two minutes, most of it the container builds. The earlier run of the same check, before labels, paused at `2025-01-10T16:00:00Z` with one prediction and matched on 15.
+
+## Stream splicing
+
+From a configured simulated date, a pre-generated variant export replaces the population that has been streaming as the source of every event, and nothing before that date changes. This is how a care-protocol change enters the stream without regenerating anything mid-replay, which Synthea cannot do reproducibly.
+
+`risk_scoring.replay.splice` is pure. `segments` turns the config's start population and its `[[splice]]` list into half-open stretches, each naming one population: the first from the start instant, each later one from midnight of its splice date to the next. A segment owns the events of its population dated inside it, in stream order, and the labels of the discharges dated inside it. The pieces are joined into one stream and one schedule, and the tick loop runs over them unchanged; it knows nothing about splices. At the splice instant itself the incoming population wins: an event at exactly that instant is the incoming population's, and the outgoing population's event at that instant is dropped. The boundary matches the start's: a segment's population is preloaded before the segment's own instant and posted from it, so preload and stream are exact complements per population.
+
+### Variant exports reuse the baseline's ids
+
+The substep was planned on the assumption that a variant population is different people with no rows in state. The exports say otherwise:
+
+| Population | Patient ids shared with the baseline | Encounter ids shared | Shared rows differing in a column state stores |
+| --- | --- | --- | --- |
+| `care_protocol` | 11,203 of 11,564 | 561,745 of 713,541 | 253 patients (birth or death date), 1,120 encounters (STOP), 1,319 conditions (STOP), scattered from 1939 to 2026 |
+| `demographic_shift` | 10,008 of 18,762 | 2,118 of 2,312,820 | every shared row: different people behind the same ids |
+
+Synthea derives its id sequence from the seed, so a module edit leaves most ids in place and perturbs a scattering of later draws, and a demographic change produces new people under the first ten thousand of the same ids. Either way a variant's history cannot be loaded beside the baseline's under the same ids: the first shared key with a different stored value raises `EventConflictError`, as it should. Two ways of tolerating the overlap were rejected. Refusing only divergent keys would refuse `care_protocol` on its 1,120 divergent encounters, so no splice could run. Keeping the baseline's row where a shared key diverges would give post-splice discharges a history that is neither export's, so their features would not equal the batch pipeline over the variant export and the skew proof across the splice would need a tolerance.
+
+Instead, every population other than the run's own is read through `populations.rekeyed`: patient and encounter ids are rewritten as `uuid5` over a fixed namespace and the population name, every other column stays byte-identical, and the shared modules cannot tell, since they use ids only to group and join. Variant patients are then distinct people in state, ids stay UUID-shaped so the prediction log does not name the population, and a splice back to the starting population is the same people under their own ids. The cost is that anything reading a spliced-in export against the log later, provenance verification or realized performance by encounter, must read that export through the same function; nothing does yet, and the function lives beside `load_population` so that it can.
+
+### Where the history is loaded, and when
+
+Every population the config names is preloaded by `start`, before the run row opens: the starting population before the start instant, each spliced-in one before its splice instant, through the same `preload_history` at a different boundary. With distinct ids, when a variant's history reaches state cannot change what the run writes, since nothing in state is read except by that patient's own discharges. Loading at the splice instant with the clock held was the alternative and was rejected: it needs a hook in the tick loop, a resume that re-runs an interrupted load, and it stalls the loop mid-run for minutes, which would land in `scored_at` as an outage that never happened. Loading everything up front makes `start` slower and nothing else.
+
+Each population is read once and its full stream dropped before the next is read, so the memory held during the run is the run's own events and labels, not two whole populations. The `start` output says, per segment, how many events and labels the population contributes and from when.
+
+### What resume trusts
+
+`resume` rebuilds the spliced stream from the splice list in the config it is given (`--config`, the same file `start` used) and the population, span, and acceleration on the row, re-validated through the config's own range rules so a splice outside the row's span is refused. The row records no splices, on purpose: the date of a scheduled change must never sit in a table anyone can read, since the sealed incident schedule will later supply the same list. The limitation is that a splice list edited between sessions changes the stream silently, and nothing on the row can detect it. The operator keeps the file as it was; the check scripts pass the same file to both commands.
+
+### Labels follow the population of origin
+
+A discharge posted from the outgoing population keeps the outgoing export's label even when the readmission that decides it falls after the splice and is never posted. The label is the batch label over that export, held from the start as every label is; the splice changes the source of events, not of truth about events already posted. An incoming population's discharges from before the splice were preloaded, never posted, and so never labelled; the preload report counts them as left unscored.
+
+### Proof
+
+`tests/test_replay_splice.py` pins the segment rules pure: the boundary at the splice instant, the tie going to the incoming population, chained splices, rekeying only populations other than the run's own, labels by discharge instant, and the cursor crossing from the outgoing population's last event to the incoming one's first. `tests/test_populations.py` pins the rewrite: exactly the id columns, deterministic, namespace-specific, UUID-shaped, joins preserved, and invisible to the cohort, feature, and label modules.
+
+`tests/test_replay_splice_postgres.py` runs the skew population until a splice at `2024-05-10` and a second synthetic population from it, one whose `p-fresh` reuses a skew id with a different birthdate, the collision the real exports produce. Against an in-process service: only the outgoing population is posted before the splice and only the incoming after, including a discharge at exactly the instant, and the outgoing population's three later discharges never; the log equals posting the spliced events one at a time after both preloads; the incoming population's index discharge logs a 180-day count of one and 38 days since a stay that was only ever preloaded, equal to the batch pipeline over the incoming export; every incoming patient id is absent from the outgoing export; pre-splice labels equal the outgoing export's, including a discharge readmitted after the splice by a stay never posted, and post-splice labels equal the incoming export's; the never-early query returns zero; and paused the tick before the splice, at it, or after it, or killed one post before or after the first incoming post, both tables equal a straight run's. `tests/test_replay_main_postgres.py` runs the commands over the same two exports: `start` with a splice reports both preloads and both segments, `resume` given the same config finishes to the straight log, a splice naming a missing export is refused before anything is read, and a splice outside the row's span is refused on resume.
+
+### Against the containers
+
+On 2026-09-06 the full exports were replayed at max speed from 2025-01-01 to 2025-03-01 with a splice to `care_protocol` at 2025-02-01, against the Compose stack and a throwaway database, from one `start`:
+
+| | baseline, before 2025-01-01 | care_protocol, before 2025-02-01 |
+| --- | --- | --- |
+| history loaded | 632,255 encounters, 483,075 medications, 366,111 conditions, 11,557 patients | 635,968 encounters, 515,394 medications, 370,741 conditions, 11,564 patients |
+| discharges left unscored | 11,294 | 11,279 |
+| preload wall time | 47 s | 52 s |
+| events contributed to the stream | 9,532 (January) | 190,196 (from February to the export's end) |
+
+The two segments together are 199,728 events and 1,020 scheduled labels, of which the run's span holds 18,921 events (7,720 encounters, 6,912 medications, 4,289 conditions) and 93 scored discharges: 49 from the baseline before the splice and 44 from `care_protocol` after it. The loop took 57.8 wall seconds over 1,416 ticks with a largest gap of 0.5 s; the whole `start`, two reads and stream builds and two preloads included, took 250 s, with a peak resident set of 2.3 GB. All 47 released labels belong to pre-splice discharges, since a February discharge cannot mature before a March 1 end; 46 are pending, the earliest unlabelled discharge is `2025-01-30T00:18:24Z`, inside the final 30 days, and the never-early query returned zero. None of the 44 post-splice `patient_id` values appears in the baseline export, and all 44 post-splice predictions' logged features equal `build_features` over the rekeyed `care_protocol` export, which is the skew check across a real splice.
 
 ## Where the harness runs
 

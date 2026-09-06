@@ -313,6 +313,9 @@ def _assemble(
                 f"{len(events_by_segment[index])} events from {population}"
                 f" from {segment.from_at} {span}, {len(labels_by_segment[index])} labels"
             )
+        # Freed here rather than when the next population rebinds the names,
+        # so two full streams are never held at once.
+        del frames, stream, schedule
     events = spliced_events(events_by_segment)
     labels = spliced_labels(labels_by_segment)
     print(f"{len(events)} clinical events in the stream, {len(labels)} labels to release")
@@ -326,8 +329,10 @@ def _preloader(conn: psycopg.Connection[Any]) -> OnLoaded:
         segment: Segment, frames: Mapping[str, pd.DataFrame], stream: Sequence[StreamEvent]
     ) -> None:
         print(f"history from {segment.population} before {segment.from_at} loading into state")
+        began = time.time()
         loaded = preload_history(conn, frames, stream, segment.from_at)
         print(preload_report(loaded))
+        print(f"loaded in {time.time() - began:.0f} wall seconds")
 
     return preload
 
