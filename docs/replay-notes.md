@@ -179,7 +179,7 @@ From a configured simulated date, a pre-generated variant export replaces the po
 
 ### Variant exports reuse the baseline's ids
 
-The substep was planned on the assumption that a variant population is different people with no rows in state. The exports say otherwise:
+Splicing was planned on the assumption that a variant population is different people with no rows in state. The exports say otherwise:
 
 | Population | Patient ids shared with the baseline | Encounter ids shared | Shared rows differing in a column state stores |
 | --- | --- | --- | --- |

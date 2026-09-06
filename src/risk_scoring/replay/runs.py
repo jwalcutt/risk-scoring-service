@@ -108,6 +108,18 @@ def open_run(conn: psycopg.Connection[Any]) -> ReplayRun | None:
     return None if row is None else _stored(row)
 
 
+def latest_run(conn: psycopg.Connection[Any]) -> ReplayRun | None:
+    """The most recently created run, finished or not, or None; read-only.
+
+    ``open_run`` answers the commands, which need the one unfinished run.
+    An audit of what a run left behind needs its row after it finished.
+    """
+    row = conn.execute(
+        f"SELECT {', '.join(_READ_COLUMNS)} FROM replay_runs ORDER BY run_id DESC LIMIT 1"
+    ).fetchone()
+    return None if row is None else _stored(row)
+
+
 def read_run(conn: psycopg.Connection[Any], run_id: int) -> ReplayRun:
     """One run by id; read-only. Raises LookupError if there is none."""
     row = conn.execute(

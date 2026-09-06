@@ -57,9 +57,8 @@ from replay_support import (
 from risk_scoring import label_log, predictions, train
 from risk_scoring.cohort import build_cohort
 from risk_scoring.features import MODEL_INPUT_COLUMNS, build_features
-from risk_scoring.labels import build_labels
 from risk_scoring.populations import rekey_id, rekeyed
-from risk_scoring.replay import clock, harness, preload, runs
+from risk_scoring.replay import audit, clock, harness, preload, runs
 from risk_scoring.replay.config import ReplayConfig, Splice
 from risk_scoring.replay.release import ScheduledLabel
 from risk_scoring.replay.splice import (
@@ -160,22 +159,6 @@ def _replay(
         except KilledMidTick:
             return None, poster
         return summary, poster
-
-
-def _batch_labels(frames: dict[str, pd.DataFrame]) -> dict[str, int]:
-    cohort = build_cohort(frames["encounters"], frames["patients"]).frame
-    labelled = build_labels(cohort, frames["encounters"])
-    return dict(zip(labelled["encounter_id"], labelled["label"].astype(int), strict=True))
-
-
-def _early_labels(dsn: str) -> int:
-    with psycopg.connect(dsn, connect_timeout=2) as conn:
-        row = conn.execute(
-            "SELECT count(*) FROM labels l JOIN predictions p USING (prediction_id)"
-            " WHERE l.released_at < p.event_time + interval '30 days'"
-        ).fetchone()
-    assert row is not None
-    return int(row[0])
 
 
 def _incoming_id(name: str) -> str:
@@ -317,8 +300,8 @@ def test_labels_follow_the_population_of_origin(
 
     assert summary is not None
     assert (summary.labels_released, summary.labels_pending) == (7, 1)
-    outgoing_batch = _batch_labels(outgoing)
-    incoming_batch = _batch_labels(incoming)
+    outgoing_batch = audit.batch_labels(outgoing)
+    incoming_batch = audit.batch_labels(incoming)
     with psycopg.connect(db_url, connect_timeout=2) as conn:
         released = {row.encounter_id: row for row in label_log.all_labels(conn)}
         discharged = {row.encounter_id: row.event_time for row in predictions.all_predictions(conn)}
@@ -330,7 +313,8 @@ def test_labels_follow_the_population_of_origin(
     assert released["e-readmit-1"].label == 1
     assert "e-readmit-2" not in discharged
     assert released[_incoming_id("e-b-r1")].label == 1
-    assert _early_labels(db_url) == 0
+    with psycopg.connect(db_url, connect_timeout=2) as conn:
+        assert audit.early_labels(conn) == 0
     assert _incoming_id("e-b-prior") not in discharged
     assert _incoming_id("e-b-history") not in discharged
     assert set(discharged) - set(released) == {_incoming_id("e-b-late")}
