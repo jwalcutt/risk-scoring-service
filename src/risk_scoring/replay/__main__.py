@@ -65,6 +65,7 @@ from risk_scoring.replay.config import (
 )
 from risk_scoring.replay.notify import Notifier, desktop_notifier
 from risk_scoring.replay.preload import PreloadSummary, preload_history
+from risk_scoring.replay.release import ScheduledLabel, label_schedule
 from risk_scoring.replay.runs import ReplayRun
 from risk_scoring.service_client import DEFAULT_SERVICE_PORT, ServiceClient
 from risk_scoring.stream import StreamEvent, ordered_events
@@ -172,18 +173,18 @@ def main(
                     "a replay run that is not finished already exists in this database;"
                     " resume it or finish it before starting another"
                 )
-            frames, events = _load(csv_dir)
+            frames, events, schedule = _load(csv_dir)
             run = _start(conn, config, frames, events)
-            _drive(conn, run, events, args, poster_factory, notify, wall_clock, sleep)
+            _drive(conn, run, events, schedule, args, poster_factory, notify, wall_clock, sleep)
     elif args.command == "resume":
         with _connect() as conn:
             run = _open_run(conn, "start one")
             csv_dir = _csv_dir(repo_root, args.data_root, run.population)
-            _, events = _load(csv_dir)
+            _, events, schedule = _load(csv_dir)
             runs.set_status(conn, run.run_id, "running")
             run = runs.read_run(conn, run.run_id)
             print(f"resuming run {run.run_id} from {clock.instant(run.sim_now)}")
-            _drive(conn, run, events, args, poster_factory, notify, wall_clock, sleep)
+            _drive(conn, run, events, schedule, args, poster_factory, notify, wall_clock, sleep)
     elif args.command == "pause":
         with _connect() as conn:
             run = _open_run(conn, "nothing to pause")
@@ -219,12 +220,16 @@ def _csv_dir(repo_root: Path, data_root: Path, population: str) -> Path:
     return csv_dir
 
 
-def _load(csv_dir: Path) -> tuple[dict[str, pd.DataFrame], list[StreamEvent]]:
+def _load(
+    csv_dir: Path,
+) -> tuple[dict[str, pd.DataFrame], list[StreamEvent], list[ScheduledLabel]]:
+    """The export, its stream, and its label schedule: ground truth held from the start."""
     print(f"reading {csv_dir}")
     frames = load_population(csv_dir)
     events = ordered_events(frames["encounters"], frames["medications"], frames["conditions"])
-    print(f"{len(events)} clinical events in the stream")
-    return frames, events
+    schedule = label_schedule(frames)
+    print(f"{len(events)} clinical events in the stream, {len(schedule)} labels to release")
+    return frames, events, schedule
 
 
 def _start(
@@ -257,6 +262,7 @@ def _drive(
     conn: psycopg.Connection[Any],
     run: ReplayRun,
     events: Sequence[StreamEvent],
+    schedule: Sequence[ScheduledLabel],
     args: argparse.Namespace,
     poster_factory: PosterFactory,
     notify: Notifier,
@@ -271,6 +277,7 @@ def _drive(
             run,
             events,
             poster,
+            labels=schedule,
             pacing=pacing,
             wall_clock=wall_clock,
             sleep=sleep,

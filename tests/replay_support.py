@@ -26,9 +26,10 @@ import psycopg
 from fastapi.testclient import TestClient
 
 from factories import write_skew_population
-from risk_scoring import predictions, train
+from risk_scoring import label_log, predictions, train
 from risk_scoring.populations import load_population
-from risk_scoring.replay import clock, preload, runs
+from risk_scoring.replay import clock, preload, release, runs
+from risk_scoring.replay.release import ScheduledLabel
 from risk_scoring.service.app import create_app
 from risk_scoring.service.config import ServiceConfig
 from risk_scoring.stream import StreamEvent, ordered_events
@@ -48,6 +49,11 @@ MAX_SPEED = clock.Pacing(acceleration=4, max_speed=True)
 # consumes a value even when the log's conflict clause drops a re-post,
 # so ids gap after a resume; scored_at is the wall clock at write.
 VOLATILE_COLUMNS = ("prediction_id", "scored_at")
+
+# The labels table's twins: label_id is a bigserial that a dropped
+# re-release still consumes, recorded_at is the wall clock at write, and
+# prediction_id is whatever the log assigned.
+LABEL_VOLATILE_COLUMNS = ("label_id", "prediction_id", "recorded_at")
 
 Serve = Callable[[str], AbstractContextManager[TestClient]]
 
@@ -94,6 +100,10 @@ def stream_of(frames: Mapping[str, pd.DataFrame]) -> list[StreamEvent]:
     return ordered_events(frames["encounters"], frames["medications"], frames["conditions"])
 
 
+def schedule_of(frames: Mapping[str, pd.DataFrame]) -> list[ScheduledLabel]:
+    return release.label_schedule(frames)
+
+
 def serving(trained_repo: tuple[Path, train.TrainingResult]) -> Serve:
     """A factory of in-process services over the trained fixture, one per DSN."""
     root, trained = trained_repo
@@ -131,6 +141,21 @@ def read_log(dsn: str) -> list[dict[str, Any]]:
         {name: value for name, value in asdict(row).items() if name not in VOLATILE_COLUMNS}
         for row in rows
     ]
+
+
+def read_labels(dsn: str) -> list[dict[str, Any]]:
+    """The labels table minus the columns the database assigns."""
+    with psycopg.connect(dsn, connect_timeout=2) as conn:
+        rows = label_log.all_labels(conn)
+    return [
+        {name: value for name, value in asdict(row).items() if name not in LABEL_VOLATILE_COLUMNS}
+        for row in rows
+    ]
+
+
+def read_outputs(dsn: str) -> dict[str, list[dict[str, Any]]]:
+    """Everything a replay writes that two runs of one stream must agree on."""
+    return {"predictions": read_log(dsn), "labels": read_labels(dsn)}
 
 
 def tick_containing(at: str, *, start: datetime = START) -> datetime:
