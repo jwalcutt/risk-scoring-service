@@ -40,7 +40,8 @@ from replay_support import (
     KilledMidTick,
     Serve,
     prepare,
-    read_log,
+    read_outputs,
+    schedule_of,
     serving,
     skew_frames,
     stream_of,
@@ -143,14 +144,16 @@ def _expected(replayed: list[StreamEvent]) -> list[dict[str, Any]]:
 
 def _straight_log(
     serve: Serve, dsn: str, frames: dict[str, pd.DataFrame], events: list[StreamEvent]
-) -> list[dict[str, Any]]:
+) -> dict[str, list[dict[str, Any]]]:
     """An uninterrupted run through the loop itself, the reference every command run meets."""
     prepare(dsn, frames, events)
     with psycopg.connect(dsn, connect_timeout=2) as conn, serve(dsn) as client:
         run = runs.open_run(conn)
         assert run is not None
-        harness.run_replay(conn, run, events, ClientPoster(client), pacing=MAX_SPEED)
-    return read_log(dsn)
+        harness.run_replay(
+            conn, run, events, ClientPoster(client), labels=schedule_of(frames), pacing=MAX_SPEED
+        )
+    return read_outputs(dsn)
 
 
 # start
@@ -173,12 +176,14 @@ def test_start_preloads_opens_the_run_and_runs_it_to_the_end(
     assert row.status == "finished"
     assert row.sim_now == END
     assert row.cursor == replayed[-1].sort_key
-    assert read_log(operator.dsn) == reference
+    assert read_outputs(operator.dsn) == reference
     assert operator.posted() == _expected(replayed)
     assert operator.notifications == [f"finished at {clock.instant(END)}"]
     assert "history loaded" in out
+    assert "labels to release" in out
     assert "finished" in out
     assert "6 discharges scored" in out
+    assert "5 labels released, 1 pending" in out
 
 
 def test_start_refuses_while_a_run_is_open_before_loading_anything(
@@ -238,7 +243,7 @@ def test_pause_marks_the_row_and_the_harness_stops_at_its_next_tick(
     operator.make_poster = ClientPoster
     out = operator.run("resume")
     assert operator.row().status == "finished"
-    assert read_log(operator.dsn) == reference
+    assert read_outputs(operator.dsn) == reference
     assert operator.posted() == _expected(replayed)
     assert "finished" in out
 
@@ -317,7 +322,7 @@ def test_ctrl_c_finishes_the_tick_marks_the_row_paused_and_resume_completes_it(
     operator.make_poster = ClientPoster
     operator.run("resume")
     assert operator.row().status == "finished"
-    assert read_log(operator.dsn) == reference
+    assert read_outputs(operator.dsn) == reference
     assert operator.posted() == _expected(replayed)
 
 
@@ -343,4 +348,4 @@ def test_resume_takes_a_run_whose_process_died_from_its_checkpoint(
     operator.make_poster = ClientPoster
     operator.run("resume")
     assert operator.row().status == "finished"
-    assert read_log(operator.dsn) == reference
+    assert read_outputs(operator.dsn) == reference
