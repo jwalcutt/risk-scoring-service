@@ -4,7 +4,8 @@ Usage (from the repo root):
     python -m risk_scoring.replay start [--config PATH] [--population NAME]
         [--start DATE] [--end DATE] [--acceleration N] [--max-speed]
         [--port PORT] [--data-root DIR]
-    python -m risk_scoring.replay resume [--max-speed] [--port PORT] [--data-root DIR]
+    python -m risk_scoring.replay resume [--config PATH] [--max-speed] [--port PORT]
+        [--data-root DIR]
     python -m risk_scoring.replay pause
     python -m risk_scoring.replay status
 
@@ -15,10 +16,24 @@ Judgment calls this module fixes:
 
 - ``start`` preloads before it opens the run row, so a Ctrl-C during the
   preload leaves no row behind and a second ``start`` finishes the
-  idempotent load. It refuses before loading anything if a run is open.
+  idempotent load. It refuses before loading anything if a run is open,
+  or if any population the config names has no export.
+- Every population the config names is preloaded at ``start``: the first
+  before the start instant, each spliced-in one before its splice
+  instant. With a spliced-in population's ids rewritten, its patients
+  are different people from the baseline's, so when its history reaches
+  state cannot change what the run writes; loading it all up front needs
+  no hook in the tick loop, no preload on resume, and leaves no false
+  outage in ``scored_at`` where a mid-run load would have stalled.
+- ``resume`` rebuilds the spliced stream from the config it is given,
+  taking only the splice list from it; the population, span, and
+  acceleration come from the row. The row records no splices, so the
+  dates of a scheduled change never sit in a table anyone can read. The
+  cost is that a splice list edited between sessions changes the stream
+  silently; the operator keeps the file as it was.
 - ``start`` runs the clock once the row exists; one command takes a
   database from nothing to a ticking replay. Every later session is
-  ``resume`` with no other argument.
+  ``resume`` with the same ``--config``.
 - The first Ctrl-C asks the loop to pause after the tick it is in, so the
   checkpoint is written and nothing is re-posted on resume. The handler
   then steps aside, so a second Ctrl-C quits at once through Python's
@@ -44,7 +59,7 @@ import argparse
 import signal
 import sys
 import time
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -55,10 +70,12 @@ import pandas as pd
 import psycopg
 
 from risk_scoring.db import database_url
-from risk_scoring.populations import load_population
+from risk_scoring.populations import load_population, rekeyed
 from risk_scoring.replay import clock, harness, runs
 from risk_scoring.replay.config import (
+    DEFAULT_CONFIG_RELPATH,
     ReplayConfig,
+    Splice,
     add_config_arguments,
     apply_overrides,
     load_config,
@@ -67,6 +84,14 @@ from risk_scoring.replay.notify import Notifier, desktop_notifier
 from risk_scoring.replay.preload import PreloadSummary, preload_history
 from risk_scoring.replay.release import ScheduledLabel, label_schedule
 from risk_scoring.replay.runs import ReplayRun
+from risk_scoring.replay.splice import (
+    Segment,
+    segment_events,
+    segment_labels,
+    segments,
+    spliced_events,
+    spliced_labels,
+)
 from risk_scoring.service_client import DEFAULT_SERVICE_PORT, ServiceClient
 from risk_scoring.stream import StreamEvent, ordered_events
 
@@ -74,6 +99,9 @@ DEFAULT_DATA_ROOT = Path("data")
 
 PosterFactory = Callable[[int], AbstractContextManager[harness.Poster]]
 """A running service to post to, given the port; closed when the run stops."""
+
+OnLoaded = Callable[[Segment, Mapping[str, pd.DataFrame], Sequence[StreamEvent]], None]
+"""Called with each segment once its population's frames and stream are built."""
 
 PAUSING = "pausing after this tick; press Ctrl-C again to quit now"
 
@@ -127,6 +155,12 @@ def build_parser() -> argparse.ArgumentParser:
     _add_run_arguments(start)
 
     resume = sub.add_parser("resume", help="continue the open run from its checkpoint")
+    resume.add_argument(
+        "--config",
+        type=Path,
+        default=DEFAULT_CONFIG_RELPATH,
+        help="the file whose splice list the run was started with",
+    )
     _add_run_arguments(resume)
 
     sub.add_parser("pause", help="ask the running harness to pause at its next tick")
@@ -166,21 +200,23 @@ def main(
 
     if args.command == "start":
         config = apply_overrides(load_config(repo_root / args.config), args)
-        csv_dir = _csv_dir(repo_root, args.data_root, config.population)
+        plan = segments(config)
+        csv_dirs = _csv_dirs(repo_root, args.data_root, plan)
         with _connect() as conn:
             if runs.open_run(conn) is not None:
                 sys.exit(
                     "a replay run that is not finished already exists in this database;"
                     " resume it or finish it before starting another"
                 )
-            frames, events, schedule = _load(csv_dir)
-            run = _start(conn, config, frames, events)
+            events, schedule = _assemble(csv_dirs, plan, on_loaded=_preloader(conn))
+            run = _open_row(conn, config)
             _drive(conn, run, events, schedule, args, poster_factory, notify, wall_clock, sleep)
     elif args.command == "resume":
         with _connect() as conn:
             run = _open_run(conn, "start one")
-            csv_dir = _csv_dir(repo_root, args.data_root, run.population)
-            _, events, schedule = _load(csv_dir)
+            plan = _resumed_plan(run, load_config(repo_root / args.config).splices)
+            csv_dirs = _csv_dirs(repo_root, args.data_root, plan)
+            events, schedule = _assemble(csv_dirs, plan)
             runs.set_status(conn, run.run_id, "running")
             run = runs.read_run(conn, run.run_id)
             print(f"resuming run {run.run_id} from {clock.instant(run.sim_now)}")
@@ -213,6 +249,29 @@ def _open_run(conn: psycopg.Connection[Any], remedy: str) -> ReplayRun:
     return run
 
 
+def _resumed_plan(run: ReplayRun, splices: tuple[Splice, ...]) -> list[Segment]:
+    """The row's span with the file's splices, through the config's own range rules."""
+    try:
+        config = ReplayConfig(
+            population=run.population,
+            start=run.start_at.astimezone(UTC).date(),
+            end=run.end_at.astimezone(UTC).date(),
+            acceleration=run.acceleration,
+            splices=splices,
+        )
+    except ValueError as error:
+        sys.exit(str(error))
+    return segments(config)
+
+
+def _csv_dirs(repo_root: Path, data_root: Path, plan: Sequence[Segment]) -> dict[str, Path]:
+    """Every population's export, resolved before anything is read or written."""
+    return {
+        population: _csv_dir(repo_root, data_root, population)
+        for population in dict.fromkeys(segment.population for segment in plan)
+    }
+
+
 def _csv_dir(repo_root: Path, data_root: Path, population: str) -> Path:
     csv_dir = repo_root / data_root / population / "csv"
     if not csv_dir.is_dir():
@@ -220,30 +279,63 @@ def _csv_dir(repo_root: Path, data_root: Path, population: str) -> Path:
     return csv_dir
 
 
-def _load(
-    csv_dir: Path,
-) -> tuple[dict[str, pd.DataFrame], list[StreamEvent], list[ScheduledLabel]]:
-    """The export, its stream, and its label schedule: ground truth held from the start."""
-    print(f"reading {csv_dir}")
-    frames = load_population(csv_dir)
-    events = ordered_events(frames["encounters"], frames["medications"], frames["conditions"])
-    schedule = label_schedule(frames)
-    print(f"{len(events)} clinical events in the stream, {len(schedule)} labels to release")
-    return frames, events, schedule
+def _assemble(
+    csv_dirs: Mapping[str, Path],
+    plan: Sequence[Segment],
+    on_loaded: OnLoaded | None = None,
+) -> tuple[list[StreamEvent], list[ScheduledLabel]]:
+    """The spliced stream and schedule: each population read once, each segment's share kept.
+
+    A population's full stream is dropped before the next is read, so the
+    memory held at the end is the run's own events and labels.
+    """
+    events_by_segment: list[list[StreamEvent]] = [[] for _ in plan]
+    labels_by_segment: list[list[ScheduledLabel]] = [[] for _ in plan]
+    for population in dict.fromkeys(segment.population for segment in plan):
+        owned = [
+            (index, segment)
+            for index, segment in enumerate(plan)
+            if segment.population == population
+        ]
+        print(f"reading {csv_dirs[population]}")
+        frames = load_population(csv_dirs[population])
+        if owned[0][1].rekey:
+            frames = rekeyed(frames, population)
+        stream = ordered_events(frames["encounters"], frames["medications"], frames["conditions"])
+        schedule = label_schedule(frames)
+        for index, segment in owned:
+            if on_loaded is not None:
+                on_loaded(segment, frames, stream)
+            events_by_segment[index] = segment_events(segment, stream)
+            labels_by_segment[index] = segment_labels(segment, schedule)
+            span = "to the end" if segment.until is None else f"until {segment.until}"
+            print(
+                f"{len(events_by_segment[index])} events from {population}"
+                f" from {segment.from_at} {span}, {len(labels_by_segment[index])} labels"
+            )
+    events = spliced_events(events_by_segment)
+    labels = spliced_labels(labels_by_segment)
+    print(f"{len(events)} clinical events in the stream, {len(labels)} labels to release")
+    return events, labels
 
 
-def _start(
-    conn: psycopg.Connection[Any],
-    config: ReplayConfig,
-    frames: dict[str, pd.DataFrame],
-    events: Sequence[StreamEvent],
-) -> ReplayRun:
-    """Preload, then open the row: a run exists only once its history is in state."""
+def _preloader(conn: psycopg.Connection[Any]) -> OnLoaded:
+    """Load a segment's history before its instant into state, and say what landed."""
+
+    def preload(
+        segment: Segment, frames: Mapping[str, pd.DataFrame], stream: Sequence[StreamEvent]
+    ) -> None:
+        print(f"history from {segment.population} before {segment.from_at} loading into state")
+        loaded = preload_history(conn, frames, stream, segment.from_at)
+        print(preload_report(loaded))
+
+    return preload
+
+
+def _open_row(conn: psycopg.Connection[Any], config: ReplayConfig) -> ReplayRun:
+    """Open the row once every population's history is in state."""
     start_at = clock.day_start(config.start)
     end_at = clock.day_start(config.end)
-    print(f"loading history before {clock.instant(start_at)} into state")
-    loaded = preload_history(conn, frames, events, clock.instant(start_at))
-    print(preload_report(loaded))
     try:
         run = runs.create_run(
             conn,
@@ -298,7 +390,7 @@ def preload_report(loaded: PreloadSummary) -> str:
     return "\n".join(
         [
             f"history loaded: {by_kind} ({loaded.rows_already_present} already present)",
-            f"{loaded.discharges_unscored} discharges before the start left unscored",
+            f"{loaded.discharges_unscored} discharges before {loaded.before} left unscored",
         ]
     )
 
