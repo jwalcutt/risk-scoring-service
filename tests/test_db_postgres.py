@@ -22,6 +22,7 @@ EXPECTED_TABLES = {
     "conditions",
     "predictions",
     "replay_runs",
+    "labels",
 }
 
 
