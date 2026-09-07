@@ -13,10 +13,14 @@ The rules these tests pin:
   different input from the one the model actually saw.
 - ``scored_at`` is set by the database at write time and lands at or
   after the wall clock the caller observed before writing.
+- A NaN feature value is refused with a ``ValueError`` before any SQL
+  runs, the same rule the input hash applies, so a value JSON cannot
+  represent never reaches the database as a serialization error.
 """
 
 from __future__ import annotations
 
+import math
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -197,3 +201,15 @@ def test_a_dropped_re_post_still_consumes_a_prediction_id(
     predictions.record_prediction(db_conn, _record(encounter_id="encounter-2"))
 
     assert [row.prediction_id for row in predictions.all_predictions(db_conn)] == [1, 3]
+
+
+def test_a_nan_feature_is_refused_before_reaching_the_database(
+    db_conn: psycopg.Connection[Any],
+) -> None:
+    """Same policy as the input hash: non-standard JSON is a ValueError, not a 500."""
+    record = _record(features={**FEATURES, "los_days": math.nan})
+
+    with pytest.raises(ValueError):
+        predictions.record_prediction(db_conn, record)
+
+    assert _row_count(db_conn) == 0

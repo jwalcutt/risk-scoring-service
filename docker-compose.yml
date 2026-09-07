@@ -6,8 +6,9 @@
 # inside the container as on the host, and any clone works unedited.
 services:
   postgres:
-    # Digest recorded in docs/service-notes.md; bump tag and digest together.
-    image: postgres:17.6-alpine
+    # Pinned by tag and digest; the digest is the multi-arch index. Bump both
+    # together and record the new digest in docs/service-notes.md.
+    image: postgres:17.6-alpine@sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94
     # The risk/risk defaults exist so a fresh clone comes up with one command.
     # They are acceptable only because the port below is published on
     # loopback: nothing off the machine can reach the database. For anything

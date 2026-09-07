@@ -22,6 +22,10 @@ Judgment calls this module fixes:
   expected traffic during a resume, not an error.
 - Each write commits on its own, matching the state layer: an
   acknowledged score is a durable score.
+- Feature values serialize with ``allow_nan=False``, the same rule the
+  input hash applies. A NaN or infinity raises a ``ValueError`` here,
+  where the value has a name, rather than surfacing as a Postgres
+  ``jsonb`` parse error at the INSERT.
 """
 
 from __future__ import annotations
@@ -98,7 +102,7 @@ def record_prediction(conn: psycopg.Connection[Any], record: PredictionRecord) -
                 record.feature_version,
                 record.cohort_version,
                 record.score,
-                json.dumps(record.features),
+                json.dumps(record.features, allow_nan=False),
             ],
         ).fetchone()
         conn.commit()
