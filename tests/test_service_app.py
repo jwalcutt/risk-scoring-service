@@ -15,6 +15,10 @@ The rules these tests pin:
   so equivalent JSON texts with different key orders hash identically.
 - Bad shape and bad field format are both rejected with 422, never a
   5xx and never a silent drop.
+- A body larger than MAX_EVENT_BYTES is refused with 413 before it is
+  buffered: on the declared Content-Length without reading a byte, and
+  on a running total for a chunked body at the chunk that crosses the
+  limit.
 
 What the accepted events actually do to state and to the prediction log
 is pinned separately, in test_service_ingest_postgres.
@@ -22,11 +26,13 @@ is pinned separately, in test_service_ingest_postgres.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import subprocess
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
@@ -36,7 +42,7 @@ from risk_scoring import train
 from risk_scoring.cohort import COHORT_VERSION
 from risk_scoring.features import FEATURE_VERSION
 from risk_scoring.payload_hash import payload_hash
-from risk_scoring.service.app import create_app, resolve_git_sha
+from risk_scoring.service.app import MAX_EVENT_BYTES, create_app, resolve_git_sha
 from risk_scoring.service.config import ServiceConfig
 from risk_scoring.train import MODEL_NAME
 
@@ -269,6 +275,94 @@ def test_malformed_payloads_rejected_4xx(client: TestClient) -> None:
         "/events", content="{not json", headers={"content-type": "application/json"}
     )
     assert invalid_json.status_code == 422
+
+
+# --- body size cap ---
+
+TOO_LARGE = {"detail": "event body exceeds 1048576 bytes"}
+JSON_HEADERS = {"content-type": "application/json"}
+
+
+def _oversized_event_bytes() -> bytes:
+    event = _patient_event()
+    payload = dict(event["payload"])  # type: ignore[arg-type]
+    payload["Id"] = "p" * (MAX_EVENT_BYTES + 1)
+    return json.dumps({"event_type": "patient", "payload": payload}).encode()
+
+
+def test_event_body_limit_is_one_mebibyte() -> None:
+    assert MAX_EVENT_BYTES == 1_048_576
+
+
+def test_oversized_declared_content_length_is_refused_unread(client: TestClient) -> None:
+    """The body is not JSON, so reading it would have produced a 422, not a 413."""
+    response = client.post(
+        "/events",
+        content=b"{not json",
+        headers={**JSON_HEADERS, "content-length": str(MAX_EVENT_BYTES + 1)},
+    )
+    assert response.status_code == 413
+    assert response.json() == TOO_LARGE
+
+
+def test_oversized_chunked_body_is_refused(client: TestClient) -> None:
+    """No Content-Length to check, so the running total has to catch it."""
+    body = _oversized_event_bytes()
+    half = len(body) // 2
+    response = client.post(
+        "/events", content=iter([body[:half], body[half:]]), headers=JSON_HEADERS
+    )
+    assert response.status_code == 413
+    assert response.json() == TOO_LARGE
+
+
+def test_chunked_body_is_refused_at_the_chunk_that_crosses_the_limit(repo_root: Path) -> None:
+    """Two 512 KiB chunks sit at the limit; the third crosses it; the fourth is never read."""
+    app = create_app(ServiceConfig(MODEL_NAME, 1), repo_root, "postgresql://unused")
+    chunks = [b"x" * (512 * 1024)] * 4
+    consumed = 0
+    sent: list[dict[str, Any]] = []
+
+    async def receive() -> dict[str, Any]:
+        nonlocal consumed
+        chunk = chunks[consumed]
+        consumed += 1
+        return {"type": "http.request", "body": chunk, "more_body": consumed < len(chunks)}
+
+    async def send(message: dict[str, Any]) -> None:
+        sent.append(message)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/events",
+        "raw_path": b"/events",
+        "root_path": "",
+        "query_string": b"",
+        "headers": [(b"content-type", b"application/json"), (b"transfer-encoding", b"chunked")],
+        "client": ("127.0.0.1", 1),
+        "server": ("127.0.0.1", 8000),
+    }
+    asyncio.run(app(scope, receive, send))
+
+    assert consumed == 3
+    assert sent[0]["type"] == "http.response.start"
+    assert sent[0]["status"] == 413
+    assert json.loads(b"".join(m.get("body", b"") for m in sent[1:])) == TOO_LARGE
+
+
+def test_event_under_the_limit_is_accepted_with_the_same_hash(client: TestClient) -> None:
+    """The bounded read hands the handler the exact bytes, so the hash is unchanged."""
+    event = _patient_event()
+    body = json.dumps(event).encode()
+    response = client.post(
+        "/events", content=body, headers={**JSON_HEADERS, "content-length": str(len(body))}
+    )
+    assert response.status_code == 202
+    assert response.json()["input_hash"] == payload_hash(event)
 
 
 def test_resolve_git_sha_prefers_the_environment_override(
