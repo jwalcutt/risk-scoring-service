@@ -12,6 +12,12 @@ sixty thousand requests. Judgment calls this module fixes:
   same signature. The repeat is safe because the service treats a
   re-posted event as a no-op, and it is bounded at one so a service that
   is genuinely gone fails instead of spinning.
+- Any other failure mid-request, a timeout being the usual one, closes the
+  kept connection before the error propagates. http.client refuses to send
+  again on a connection still waiting for a reply, so a caller that
+  catches the error and posts again would otherwise get CannotSendRequest
+  from the cached socket instead of a fresh connection. The failure is not
+  retried here; a timeout says nothing about whether the service is back.
 - Only 202 is success. The service answers 4xx for a malformed, out of
   order, or contradicting event, and every one of those is a defect in
   the caller's stream rather than something to count and continue past,
@@ -87,21 +93,28 @@ class ServiceClient:
     def _send(self, method: str, path: str, body: str | None) -> tuple[int, bytes]:
         connection = self._open()
         headers = {"content-type": "application/json"} if body is not None else {}
-        connection.request(method, path, body=body, headers=headers)
-        response = connection.getresponse()
-        return response.status, response.read()
+        try:
+            connection.request(method, path, body=body, headers=headers)
+            response = connection.getresponse()
+            return response.status, response.read()
+        except BaseException:
+            # Whatever interrupted the exchange, the connection is now
+            # somewhere mid-request and cannot carry another one. Drop it
+            # so the next call opens a fresh one instead of failing on it.
+            self.close()
+            raise
 
     def _request(self, method: str, path: str, body: str | None = None) -> tuple[int, bytes]:
         # A connection that has already carried a request and is now
         # refused was dropped by the far end rather than never made, so it
-        # is worth reopening exactly once.
+        # is worth reopening exactly once. The failed send has already
+        # closed it, so the repeat opens a new connection.
         reusing = self._connection is not None
         try:
             return self._send(method, path, body)
         except _DROPPED:
             if not reusing:
                 raise
-            self.close()
             return self._send(method, path, body)
 
     def wait_for_health(self, timeout: float = HEALTH_TIMEOUT_SECONDS) -> None:

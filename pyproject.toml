@@ -25,6 +25,8 @@ dev = [
     "ruff>=0.6",
     "mypy>=1.11",
     "pandas-stubs>=2.2",
+    # Backs Starlette's TestClient, which deprecates httpx and warns on every
+    # test run without this installed. Nothing imports it directly.
     "httpx2>=2.12",
 ]
 
