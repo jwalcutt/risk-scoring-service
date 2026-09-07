@@ -26,7 +26,9 @@ The rules these tests pin:
 from __future__ import annotations
 
 import logging
+import threading
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -337,6 +339,57 @@ def test_conflict_response_names_the_column_and_logs_the_values(
     assert "encounter-1" in logged
     assert "2024-05-04T17:30:00Z" in logged
     assert "2024-05-05T17:30:00Z" in logged
+
+
+def test_the_same_discharge_posted_at_once_from_many_threads_is_stored_and_scored_once(
+    client: TestClient, conn: psycopg.Connection[Any]
+) -> None:
+    """Concurrent identical posts: every one accepted, one row, one score."""
+    _post(client, _patient())
+    event = _discharge()
+    workers = 8
+    start = threading.Barrier(workers)
+
+    def post() -> tuple[int, dict[str, Any]]:
+        start.wait()
+        response = client.post("/events", json=event)
+        return response.status_code, response.json()
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        outcomes = list(executor.map(lambda _: post(), range(workers)))
+
+    assert [status for status, _ in outcomes] == [202] * workers
+    assert sum(body["scored"] for _, body in outcomes) == 1
+    assert len(state.patient_history(conn, "patient-1").encounters) == 1
+    assert _prediction_count(conn) == 1
+
+
+def test_the_connection_is_released_while_the_model_scores(
+    trained_repo: tuple[Path, train.TrainingResult], db_url: str
+) -> None:
+    """Scoring is CPU work; the pool's connection is for the reads and writes only.
+
+    A pool of one connection makes the hold observable: a model that needs
+    that connection while it scores can only get it if the request let go.
+    """
+    root, trained = trained_repo
+    config = ServiceConfig(MODEL_NAME, trained.model_version, pool_size=1)
+    with TestClient(create_app(config, root, db_url)) as client:
+        pool = client.app.state.pool
+        inner = client.app.state.model
+
+        class NeedsTheConnection:
+            def predict(self, model_input: pd.DataFrame) -> Any:
+                with pool.connection(timeout=1.0):
+                    pass
+                return inner.predict(model_input)
+
+        client.app.state.model = NeedsTheConnection()
+        _post(client, _patient())
+
+        body = _post(client, _discharge())
+
+    assert body["scored"] is True
 
 
 def test_divergent_repost_is_rejected_and_leaves_the_first_score_standing(

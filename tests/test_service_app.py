@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import subprocess
 from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -55,6 +56,29 @@ def client(trained_repo: tuple[Path, train.TrainingResult], db_url: str) -> Iter
     app = create_app(ServiceConfig(MODEL_NAME, trained.model_version), root, db_url)
     with TestClient(app) as test_client:
         yield test_client
+
+
+@contextmanager
+def _serving(
+    trained_repo: tuple[Path, train.TrainingResult], db_url: str, pool_size: int
+) -> Iterator[TestClient]:
+    """A running instance whose pool is capped at ``pool_size`` connections."""
+    root, trained = trained_repo
+    config = ServiceConfig(MODEL_NAME, trained.model_version, pool_size=pool_size)
+    with TestClient(create_app(config, root, db_url)) as test_client:
+        yield test_client
+
+
+@contextmanager
+def _holding_connections(client: TestClient, count: int) -> Iterator[None]:
+    """Take ``count`` connections out of the app's pool for the duration."""
+    pool = client.app.state.pool
+    held = [pool.getconn() for _ in range(count)]
+    try:
+        yield
+    finally:
+        for conn in held:
+            pool.putconn(conn)
 
 
 def _event(event_type: str, row: dict[str, str], fields: tuple[str, ...]) -> dict[str, object]:
@@ -253,3 +277,32 @@ def test_an_empty_git_sha_override_falls_back_to_the_working_tree(
     bare = tmp_path / "not-a-repo"
     bare.mkdir()
     assert resolve_git_sha(bare) is None
+
+
+# --- the connection pool ---
+
+
+def test_the_pool_holds_as_many_connections_as_the_config_allows(
+    trained_repo: tuple[Path, train.TrainingResult], db_url: str
+) -> None:
+    """With one of two connections taken elsewhere, a post still has one to use."""
+    with _serving(trained_repo, db_url, pool_size=2) as client:
+        client.app.state.pool.timeout = 1.0
+        with _holding_connections(client, 1):
+            response = client.post("/events", json=_patient_event())
+
+    assert response.status_code == 202
+
+
+def test_an_exhausted_pool_answers_503_not_500(
+    trained_repo: tuple[Path, train.TrainingResult], db_url: str
+) -> None:
+    """Waiting out the pool is a capacity condition, reported as one."""
+    with _serving(trained_repo, db_url, pool_size=1) as client:
+        client.app.state.pool.timeout = 0.5
+        with _holding_connections(client, 1):
+            response = client.post("/events", json=_patient_event())
+
+    assert response.status_code == 503
+    assert response.headers["content-type"].startswith("application/json")
+    assert "connection" in response.json()["detail"]

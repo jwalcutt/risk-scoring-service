@@ -9,7 +9,8 @@ serving-time feature recompute rides on.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from types import SimpleNamespace
 from typing import Any
 
 import pandas as pd
@@ -398,3 +399,72 @@ def test_record_batch_with_a_divergent_row_raises_and_keeps_the_new_rows(
 
 def test_record_batch_of_nothing_records_nothing(db_conn: psycopg.Connection[Any]) -> None:
     assert state.record_batch(db_conn, []) == 0
+
+
+# The read-back race: an insert that hit a conflict, then a read-back that
+# finds no row. With more than one writer this is a moment to retry, not a
+# reason to fail the request.
+
+_READ_BACK = "FROM encounters WHERE id = %s"
+
+
+class _TamperedReadBack(psycopg.Connection[Any]):
+    """A real connection whose encounter read-backs pass through a hook first."""
+
+    read_backs: int
+    before_read_back: Callable[[], bool]
+    """Runs before each read-back; returning False makes that read-back find nothing."""
+
+    def execute(self, query: Any, params: Any = None, **kwargs: Any) -> Any:
+        if isinstance(query, str) and query.startswith("SELECT") and _READ_BACK in query:
+            self.read_backs += 1
+            if not self.before_read_back():
+                return SimpleNamespace(fetchone=lambda: None)
+        return super().execute(query, params, **kwargs)
+
+
+@pytest.fixture()
+def tampered(db_url: str) -> Iterator[_TamperedReadBack]:
+    conn = _TamperedReadBack.connect(db_url, connect_timeout=2)
+    conn.read_backs = 0
+    conn.before_read_back = lambda: True
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def test_a_row_that_vanished_before_the_read_back_is_inserted_on_retry(
+    db_url: str, tampered: _TamperedReadBack
+) -> None:
+    row = make_encounter_row()
+    with psycopg.connect(db_url, connect_timeout=2, autocommit=True) as other:
+        state.record_encounter(other, state.EncounterEvent.from_row(row))
+
+        def delete_it_once() -> bool:
+            if tampered.read_backs == 1:
+                other.execute("DELETE FROM encounters WHERE id = %s", [row["Id"]])
+            return True
+
+        tampered.before_read_back = delete_it_once
+
+        assert state.record_encounter(tampered, state.EncounterEvent.from_row(row)) is True
+
+    history = state.patient_history(tampered, "patient-1")
+    pd.testing.assert_frame_equal(history.encounters, _frame([row], state.ENCOUNTER_COLUMNS))
+
+
+def test_a_read_back_that_never_finds_the_row_gives_up_after_a_bounded_number_of_tries(
+    db_url: str, tampered: _TamperedReadBack
+) -> None:
+    row = make_encounter_row()
+    with psycopg.connect(db_url, connect_timeout=2, autocommit=True) as other:
+        state.record_encounter(other, state.EncounterEvent.from_row(row))
+    tampered.before_read_back = lambda: False
+
+    with pytest.raises(RuntimeError, match="encounters"):
+        state.record_encounter(tampered, state.EncounterEvent.from_row(row))
+
+    assert 1 < tampered.read_backs <= 5
+    # The failed attempt rolled back, so the connection is still usable.
+    assert _record(tampered, "encounter", make_encounter_row(Id="encounter-2")) is True
