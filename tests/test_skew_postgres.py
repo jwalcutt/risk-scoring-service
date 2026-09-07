@@ -76,7 +76,7 @@ def test_population_exercises_the_boundaries_it_claims(
     """Guard the fixture: a population that collapses would make the skew test vacuous."""
     batch = _batch_features(skew_frames).set_index("encounter_id")
 
-    assert len(batch) == 10
+    assert len(batch) == 13
     assert batch.loc["e-fresh", "days_since_prev_discharge"] == 365.0
     assert batch.loc["e-fresh", "prior_inpatient_180d"] == 0
     assert batch.loc["e-edge-index", "prior_inpatient_180d"] == 1
@@ -84,6 +84,10 @@ def test_population_exercises_the_boundaries_it_claims(
     assert batch.loc["e-gap-index", "days_since_prev_discharge"] == 365.0
     assert batch.loc["e-gap-overlap-b", "days_since_prev_discharge"] == 0.0
     assert batch.loc["e-readmit-2", "days_since_prev_discharge"] == 10.0
+    assert batch.loc["e-twin-a", "prior_inpatient_180d"] == 1
+    assert batch.loc["e-twin-b", "prior_inpatient_180d"] == 1
+    assert batch.loc["e-twin-a", "days_since_prev_discharge"] == 9.0
+    assert batch.loc["e-twin-b", "days_since_prev_discharge"] == 11.0
     assert batch.loc["e-full-index", "active_medication_count"] == 3
     assert batch.loc["e-full-index", "active_disorder_count"] == 4
     assert batch.loc["e-full-index", "flag_chf"] == 1
@@ -98,7 +102,7 @@ def test_serving_features_equal_training_features_exactly(
     served = _sorted_by_encounter(_replay(db_conn, skew_frames))
 
     assert served["encounter_id"].tolist() == batch["encounter_id"].tolist()
-    assert len(served) == 10
+    assert len(served) == 13
     pd.testing.assert_frame_equal(served, batch, check_exact=True)
 
 

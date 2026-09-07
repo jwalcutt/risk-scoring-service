@@ -386,18 +386,19 @@ def payload_frame(rows: Iterable[Mapping[str, str]], columns: Sequence[str]) -> 
 def write_skew_population(csv_dir: Path) -> int:
     """Population built to exercise every feature boundary at once.
 
-    Eight patients cover the cases the batch feature tests pin
+    Nine patients cover the cases the batch feature tests pin
     individually: the 180-day window's inclusive far edge and the day
     beyond it, the days-since-previous cap and its no-history sentinel,
     overlapping stays flooring the gap at zero, a readmission whose
-    features must see the index stay, medications stopping exactly at the
-    discharge instant, conditions starting and stopping on the discharge
-    date, a finding that is not a disorder, two prescriptions of one drug
-    sharing an encounter and a start instant, history-based flags from a
-    resolved situation code and from an ICD10 malignancy, and events
-    dated after the discharge that no feature may read. Three patients
-    are excluded outright: a minor, an in-hospital death, and one with no
-    inpatient encounter.
+    features must see the index stay, two inpatient stays ending at the
+    same instant after an earlier discharge, medications stopping exactly
+    at the discharge instant, conditions starting and stopping on the
+    discharge date, a finding that is not a disorder, two prescriptions
+    of one drug sharing an encounter and a start instant, history-based
+    flags from a resolved situation code and from an ICD10 malignancy,
+    and events dated after the discharge that no feature may read. Three
+    patients are excluded outright: a minor, an in-hospital death, and
+    one with no inpatient encounter.
 
     Returns the number of encounters the cohort rules admit.
     """
@@ -407,6 +408,7 @@ def write_skew_population(csv_dir: Path) -> int:
         make_patient_row(Id="p-gap", BIRTHDATE="1948-11-03"),
         make_patient_row(Id="p-readmit", BIRTHDATE="1962-07-07"),
         make_patient_row(Id="p-full", BIRTHDATE="1951-09-30"),
+        make_patient_row(Id="p-twin", BIRTHDATE="1966-04-12"),
         make_patient_row(Id="p-minor", BIRTHDATE="2008-06-01"),
         make_patient_row(Id="p-died", BIRTHDATE="1940-01-01", DEATHDATE="2024-03-12"),
         make_patient_row(Id="p-outpatient", BIRTHDATE="1975-01-01"),
@@ -441,6 +443,12 @@ def write_skew_population(csv_dir: Path) -> int:
         stay("e-readmit-2", "p-readmit", "2024-05-15T08:00:00Z", "2024-05-18T08:00:00Z"),
         # The medication and condition boundaries all land on this discharge.
         stay("e-full-index", "p-full", "2024-08-01T06:00:00Z", "2024-08-05T06:00:00Z"),
+        # Two stays ending at one instant. Each sees the earlier discharge as
+        # its only prior and measures its gap from it, never from its twin,
+        # which is what a stream scoring the first of them can know.
+        stay("e-twin-earlier", "p-twin", "2023-12-28T10:00:00Z", "2024-01-01T10:00:00Z"),
+        stay("e-twin-a", "p-twin", "2024-01-10T10:00:00Z", "2024-01-14T10:00:00Z"),
+        stay("e-twin-b", "p-twin", "2024-01-12T10:00:00Z", "2024-01-14T10:00:00Z"),
         stay("e-minor", "p-minor", "2024-01-02T08:00:00Z", "2024-01-05T08:00:00Z"),
         stay("e-died", "p-died", "2024-03-08T08:00:00Z", "2024-03-12T08:00:00Z"),
         stay(
@@ -507,7 +515,7 @@ def write_skew_population(csv_dir: Path) -> int:
     write_rows_csv(csv_dir / "encounters.csv", encounters)
     write_rows_csv(csv_dir / "medications.csv", medications)
     write_rows_csv(csv_dir / "conditions.csv", conditions)
-    return 10
+    return 13
 
 
 def write_splice_population(csv_dir: Path) -> int:

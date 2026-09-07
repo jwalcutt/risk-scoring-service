@@ -35,7 +35,7 @@ from risk_scoring.service.config import ServiceConfig
 from risk_scoring.stream import StreamEvent, ordered_events
 from risk_scoring.train import MODEL_NAME
 
-# The skew population's replay span: four cohort discharges fall before
+# The skew population's replay span: seven cohort discharges fall before
 # this start and six after it, and the population's last event is dated
 # the day before this end.
 START = datetime(2024, 4, 1, tzinfo=UTC)
@@ -43,8 +43,8 @@ END = datetime(2024, 8, 7, tzinfo=UTC)
 POPULATION = "skew"
 
 # Where the splice population takes over from the skew population: three
-# skew discharges fall before it and three after, and five of the splice
-# population's fall at or after it.
+# skew discharges fall between the start and it and three after, and five
+# of the splice population's fall at or after it.
 SPLICE_AT = datetime(2024, 5, 10, tzinfo=UTC)
 SPLICE_POPULATION = "variant"
 
