@@ -4,7 +4,12 @@ from pathlib import Path
 
 import pytest
 
-from risk_scoring.datagen.config import GenerationConfig, build_synthea_argv, load_config
+from risk_scoring.datagen.config import (
+    GenerationConfig,
+    InsecureJarUrlError,
+    build_synthea_argv,
+    load_config,
+)
 
 CONFIG_TOML = """
 [synthea]
@@ -105,3 +110,21 @@ def test_demographic_shift_argv_adds_age_range(config: GenerationConfig) -> None
 def test_unknown_population_raises_key_error(config: GenerationConfig) -> None:
     with pytest.raises(KeyError):
         build_synthea_argv(config, "nonexistent", Path("/repo"))
+
+
+@pytest.mark.parametrize(
+    "jar_url",
+    [
+        "http://example.com/synthea-with-dependencies.jar",
+        "file:///tmp/synthea-with-dependencies.jar",
+        "ftp://example.com/synthea-with-dependencies.jar",
+    ],
+)
+def test_load_config_rejects_jar_url_that_is_not_https(tmp_path: Path, jar_url: str) -> None:
+    path = tmp_path / "generation.toml"
+    path.write_text(
+        CONFIG_TOML.replace("https://example.com/synthea-with-dependencies.jar", jar_url)
+    )
+
+    with pytest.raises(InsecureJarUrlError):
+        load_config(path)
