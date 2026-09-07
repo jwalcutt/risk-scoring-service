@@ -49,6 +49,7 @@ from risk_scoring.cohort import COHORT_VERSION, build_cohort
 from risk_scoring.features import FEATURE_COLUMNS, FEATURE_VERSION, build_features
 from risk_scoring.payload_hash import payload_hash
 from risk_scoring.service.app import create_app
+from risk_scoring.service.auth import bearer_headers, require_api_token
 from risk_scoring.service.config import ServiceConfig
 from risk_scoring.train import MODEL_NAME
 
@@ -73,7 +74,7 @@ DISCHARGE_ROW = make_encounter_row(
 def client(trained_repo: tuple[Path, train.TrainingResult], db_url: str) -> Iterator[TestClient]:
     root, trained = trained_repo
     app = create_app(ServiceConfig(MODEL_NAME, trained.model_version), root, db_url)
-    with TestClient(app) as test_client:
+    with TestClient(app, headers=bearer_headers(require_api_token())) as test_client:
         yield test_client
 
 
@@ -374,7 +375,8 @@ def test_the_connection_is_released_while_the_model_scores(
     """
     root, trained = trained_repo
     config = ServiceConfig(MODEL_NAME, trained.model_version, pool_size=1)
-    with TestClient(create_app(config, root, db_url)) as client:
+    app = create_app(config, root, db_url)
+    with TestClient(app, headers=bearer_headers(require_api_token())) as client:
         pool = client.app.state.pool
         inner = client.app.state.model
 

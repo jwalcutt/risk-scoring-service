@@ -19,6 +19,10 @@ The rules these tests pin:
   buffered: on the declared Content-Length without reading a byte, and
   on a running total for a chunked body at the chunk that crosses the
   limit.
+- POST /events requires the bearer token from RISK_SCORING_API_TOKEN
+  and answers 401 without it or with a wrong one, before reading the
+  body. /health and /version stay open. Startup refuses to run when the
+  variable is unset or empty.
 
 What the accepted events actually do to state and to the prediction log
 is pinned separately, in test_service_ingest_postgres.
@@ -35,6 +39,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from factories import make_encounter_row, make_patient_row
@@ -43,6 +48,7 @@ from risk_scoring.cohort import COHORT_VERSION
 from risk_scoring.features import FEATURE_VERSION
 from risk_scoring.payload_hash import payload_hash
 from risk_scoring.service.app import MAX_EVENT_BYTES, create_app, resolve_git_sha
+from risk_scoring.service.auth import ENV_API_TOKEN, bearer_headers
 from risk_scoring.service.config import ServiceConfig
 from risk_scoring.train import MODEL_NAME
 
@@ -57,22 +63,27 @@ PATIENT_FIELDS = ("Id", "BIRTHDATE", "DEATHDATE")
 
 
 @pytest.fixture()
-def client(trained_repo: tuple[Path, train.TrainingResult], db_url: str) -> Iterator[TestClient]:
+def app(trained_repo: tuple[Path, train.TrainingResult], db_url: str) -> FastAPI:
     root, trained = trained_repo
-    app = create_app(ServiceConfig(MODEL_NAME, trained.model_version), root, db_url)
-    with TestClient(app) as test_client:
+    return create_app(ServiceConfig(MODEL_NAME, trained.model_version), root, db_url)
+
+
+@pytest.fixture()
+def client(app: FastAPI, api_token: str) -> Iterator[TestClient]:
+    """A started service whose every request carries the token."""
+    with TestClient(app, headers=bearer_headers(api_token)) as test_client:
         yield test_client
 
 
 @contextmanager
 def _serving(
-    trained_repo: tuple[Path, train.TrainingResult], db_url: str, pool_size: int
+    trained_repo: tuple[Path, train.TrainingResult], db_url: str, pool_size: int, api_token: str
 ) -> Iterator[TestClient]:
     """A running instance whose pool is capped at ``pool_size`` connections."""
     root, trained = trained_repo
     config = ServiceConfig(MODEL_NAME, trained.model_version, pool_size=pool_size)
-    with TestClient(create_app(config, root, db_url)) as test_client:
-        yield test_client
+    with TestClient(create_app(config, root, db_url), headers=bearer_headers(api_token)) as client:
+        yield client
 
 
 @contextmanager
@@ -388,14 +399,66 @@ def test_an_empty_git_sha_override_falls_back_to_the_working_tree(
     assert resolve_git_sha(bare) is None
 
 
+# --- bearer token ---
+
+
+def test_post_event_without_a_bearer_token_is_401(client: TestClient) -> None:
+    """Whoever can reach the port must not be able to write state."""
+    del client.headers["Authorization"]
+
+    response = client.post("/events", json=_patient_event())
+
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"] == "Bearer"
+    assert "RISK_SCORING_API_TOKEN" in response.json()["detail"]
+
+
+def test_post_event_with_the_wrong_token_is_401(client: TestClient) -> None:
+    detail = "a bearer token matching RISK_SCORING_API_TOKEN is required"
+    for wrong in ("Bearer not-the-token", "Bearer test-token-and-more", "Basic test-token"):
+        response = client.post("/events", json=_patient_event(), headers={"Authorization": wrong})
+        assert response.status_code == 401, wrong
+        assert response.json()["detail"] == detail
+
+
+def test_the_token_is_checked_before_the_body(client: TestClient) -> None:
+    """An unauthenticated caller learns nothing about the event schema."""
+    del client.headers["Authorization"]
+    response = client.post("/events", json={"event_type": "observation"})
+    assert response.status_code == 401
+
+
+def test_health_and_version_need_no_token(client: TestClient) -> None:
+    del client.headers["Authorization"]
+    assert client.get("/health").status_code == 200
+    assert client.get("/version").status_code == 200
+
+
+def test_startup_fails_loudly_when_the_token_is_unset(
+    app: FastAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An open service is the defect the token exists to prevent, so it must not start."""
+    monkeypatch.delenv(ENV_API_TOKEN)
+    with pytest.raises(RuntimeError, match=ENV_API_TOKEN), TestClient(app):
+        pass
+
+
+def test_startup_treats_an_empty_token_as_unset(
+    app: FastAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(ENV_API_TOKEN, "  ")
+    with pytest.raises(RuntimeError, match=ENV_API_TOKEN), TestClient(app):
+        pass
+
+
 # --- the connection pool ---
 
 
 def test_the_pool_holds_as_many_connections_as_the_config_allows(
-    trained_repo: tuple[Path, train.TrainingResult], db_url: str
+    trained_repo: tuple[Path, train.TrainingResult], db_url: str, api_token: str
 ) -> None:
     """With one of two connections taken elsewhere, a post still has one to use."""
-    with _serving(trained_repo, db_url, pool_size=2) as client:
+    with _serving(trained_repo, db_url, 2, api_token) as client:
         client.app.state.pool.timeout = 1.0
         with _holding_connections(client, 1):
             response = client.post("/events", json=_patient_event())
@@ -404,10 +467,10 @@ def test_the_pool_holds_as_many_connections_as_the_config_allows(
 
 
 def test_an_exhausted_pool_answers_503_not_500(
-    trained_repo: tuple[Path, train.TrainingResult], db_url: str
+    trained_repo: tuple[Path, train.TrainingResult], db_url: str, api_token: str
 ) -> None:
     """Waiting out the pool is a capacity condition, reported as one."""
-    with _serving(trained_repo, db_url, pool_size=1) as client:
+    with _serving(trained_repo, db_url, 1, api_token) as client:
         client.app.state.pool.timeout = 0.5
         with _holding_connections(client, 1):
             response = client.post("/events", json=_patient_event())

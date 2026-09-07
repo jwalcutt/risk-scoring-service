@@ -86,7 +86,7 @@ Pandas emitted one `UserWarning` per run about falling back from datetime format
 python -m risk_scoring.service run
 ```
 
-The command reads `configs/service.toml` from the working directory, loads the pinned model version from the repo-local MLflow registry, opens a connection pool against `RISK_SCORING_DATABASE_URL` (defaulting to the Compose instance), and serves on port 8000 (`--port` overrides it). Startup fails with a nonzero exit if the pinned version is absent from the registry or the database is unreachable; the service never starts without either.
+The command reads `configs/service.toml` from the working directory, reads the bearer token from `RISK_SCORING_API_TOKEN`, loads the pinned model version from the repo-local MLflow registry, opens a connection pool against `RISK_SCORING_DATABASE_URL` (defaulting to the Compose instance), and serves on port 8000 (`--port` overrides it). Startup fails with a nonzero exit if the token is unset, the pinned version is absent from the registry, or the database is unreachable; the service never starts without all three.
 
 ## Endpoints
 
@@ -94,7 +94,7 @@ The command reads `configs/service.toml` from the working directory, loads the p
 | --- | --- |
 | `GET /health` | `{"status": "ok"}`. A 200 implies startup completed, so the model is loaded and the database is reachable. |
 | `GET /version` | Model name and pinned version from the config, `FEATURE_VERSION`, `COHORT_VERSION`, and the git SHA (null when unresolvable). |
-| `POST /events` | Ingests one event and answers 202 with the event type, the input hash, whether the event was scored, and the prediction id and score when it was. |
+| `POST /events` | Requires `Authorization: Bearer <token>`; 401 without it or with a wrong one. Ingests one event and answers 202 with the event type, the input hash, whether the event was scored, and the prediction id and score when it was. |
 
 The git SHA comes from `git rev-parse HEAD` at startup and is null when the working directory is not a repository. The container image will not contain `.git`, so a build-time override must be added when the image exists.
 
@@ -212,7 +212,7 @@ The registry is local and single-user, and a loaded model is a pickled artifact:
 | --- | --- |
 | `postgres` | State, the prediction log, and whatever is built on them. Host port 5433. |
 | `migrate` | One-shot `python -m risk_scoring.db migrate`, gated on Postgres reporting healthy. |
-| `app` | The service, gated on `migrate` completing successfully. Host port 8001. |
+| `app` | The service, gated on `migrate` completing successfully. Host port 8001, published on loopback only. |
 
 Schema changes are a separate one-shot service rather than part of the service's own start, so restarting the service is a pure restart and never issues DDL. That keeps the restart check honest: what it exercises is a process coming back, not a schema being reapplied.
 
@@ -224,6 +224,19 @@ Two things the container forced into the service code:
 
 - The CLI gained `--host`, defaulting to `127.0.0.1`. A host process should not be reachable off the machine; the image's command asks for `0.0.0.0` explicitly, because its port is published.
 - `resolve_git_sha` now prefers `RISK_SCORING_GIT_SHA` over `git rev-parse`. An image carries no `.git`, so `/version` was reporting a null commit for the code it was built from. The build passes the SHA as an argument, placed after the dependency layers so a new commit rebuilds one cheap layer. An unset argument arrives as an empty string, which is not a SHA and falls through to the working tree, so a host process is unaffected.
+
+## The bearer token and the loopback bind
+
+Recorded 2026-09-06. `POST /events` writes patient, encounter, medication, and condition rows and appends to the prediction log, and until this change it did so for anyone who could reach the port. Docker publishes a port on `0.0.0.0` unless told otherwise, so the container's `--host 0.0.0.0` plus the Compose port mapping offered the endpoint to every machine on the host's network. The data is synthetic and the stack is a laptop stack, which is why this stayed a medium finding rather than a high one, but the same file would be the starting point for a deployment that fronts real records, and a service whose state anyone can poison is not one whose monitoring results mean anything.
+
+Two changes, each small on its own:
+
+- `POST /events` requires `Authorization: Bearer <token>`. The service reads the token from `RISK_SCORING_API_TOKEN` at startup, in the lifespan beside the model load and the pool open, and raises the same `RuntimeError` those do when the variable is unset or blank. A service with no token does not start; it never runs open by accident. The check is a FastAPI route dependency, so it runs before the body is parsed and an unauthenticated caller gets a 401 whatever it posted, never a 422 that describes the schema. The comparison is `hmac.compare_digest`. `/health` and `/version` stay open: the Compose healthcheck and the client's readiness poll hit `/health`, and `/version` reveals nothing the prediction log does not already record.
+- The published port is `127.0.0.1:8001`, so the service answers on the host and nowhere else. The container still listens on `0.0.0.0` inside its own network namespace, because that is how a published port reaches it at all; what changed is which host interface Docker forwards from.
+
+`ServiceClient` reads the same variable, with an explicit `token=` argument taking precedence, and sends the header on every request. It fails at construction when neither is available, naming the variable, because the alternative is sixty thousand 401s. The replay commands, the batch scorer, and the check scripts all construct it, so exporting the variable once in the shell covers the service and everything that posts to it. Compose defaults the variable to `dev-token` so the documented one-command stack still comes up; a `.env` file or an exported variable overrides it, and CI sets its own value for the database-backed tests.
+
+What was considered and not done: a per-route allowlist of IPs, which the loopback bind makes redundant; a token in `configs/service.toml`, which would commit a secret; and requiring the token on the read-only routes too, which would break the healthcheck for no gain. Rate limiting and TLS are not in scope for a stack that no longer accepts connections from off the host.
 
 ## Restart and state rebuild
 

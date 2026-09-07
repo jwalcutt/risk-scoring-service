@@ -28,6 +28,10 @@ sixty thousand requests. Judgment calls this module fixes:
 - Requests go through the standard library rather than an HTTP client
   library, because the only one this project depends on is a test-time
   dependency and this module ships.
+- Every request carries the bearer token the service requires. It comes
+  from ``RISK_SCORING_API_TOKEN`` unless the constructor is handed one,
+  and a client with no token fails at construction, naming the variable,
+  rather than after the first of sixty thousand 401s.
 """
 
 from __future__ import annotations
@@ -38,6 +42,8 @@ import time
 from collections.abc import Iterable, Mapping
 from types import TracebackType
 from typing import Any
+
+from risk_scoring.service.auth import bearer_headers, require_api_token
 
 DEFAULT_SERVICE_HOST = "127.0.0.1"
 DEFAULT_SERVICE_PORT = 8001
@@ -61,10 +67,12 @@ class ServiceClient:
         port: int = DEFAULT_SERVICE_PORT,
         host: str = DEFAULT_SERVICE_HOST,
         timeout: float = 60.0,
+        token: str | None = None,
     ) -> None:
         self.host = host
         self.port = port
         self.timeout = timeout
+        self._headers = bearer_headers(require_api_token() if token is None else token)
         self._connection: http.client.HTTPConnection | None = None
 
     def __enter__(self) -> ServiceClient:
@@ -92,7 +100,9 @@ class ServiceClient:
 
     def _send(self, method: str, path: str, body: str | None) -> tuple[int, bytes]:
         connection = self._open()
-        headers = {"content-type": "application/json"} if body is not None else {}
+        headers = dict(self._headers)
+        if body is not None:
+            headers["content-type"] = "application/json"
         try:
             connection.request(method, path, body=body, headers=headers)
             response = connection.getresponse()

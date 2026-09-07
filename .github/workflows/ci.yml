@@ -81,6 +81,7 @@ jobs:
         env:
           RISK_SCORING_REQUIRE_DB: "1"
           RISK_SCORING_DATABASE_URL: postgresql://risk:risk@localhost:5433/risk_scoring
+          RISK_SCORING_API_TOKEN: ci-token
 
       - name: Evaluation gate (synthetic population)
         run: uv run python scripts/run_gate_ci.py --report gate_report.md

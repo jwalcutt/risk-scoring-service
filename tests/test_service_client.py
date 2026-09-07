@@ -17,6 +17,7 @@ from typing import Any
 
 import pytest
 
+from risk_scoring.service.auth import ENV_API_TOKEN
 from risk_scoring.service_client import ServiceClient
 
 Responder = Callable[[str, str], tuple[int, dict[str, Any]]]
@@ -31,6 +32,7 @@ class _Counter:
     def __init__(self) -> None:
         self.connections = 0
         self.requests: list[tuple[str, str]] = []
+        self.authorizations: list[str | None] = []
 
 
 def _serve(responder: Responder, counter: _Counter) -> type[BaseHTTPRequestHandler]:
@@ -48,6 +50,7 @@ def _serve(responder: Responder, counter: _Counter) -> type[BaseHTTPRequestHandl
             length = int(self.headers.get("content-length", 0))
             body = self.rfile.read(length).decode() if length else ""
             counter.requests.append((self.path, body))
+            counter.authorizations.append(self.headers.get("authorization"))
             status, payload = responder(self.path, body)
             if status == _DROP:
                 self.close_connection = True
@@ -239,6 +242,35 @@ def test_the_retry_is_bounded_at_one_reconnect(
         with pytest.raises(ConnectionError):
             client.post_event(_event())
     assert counter.connections == 2
+
+
+def test_every_request_carries_the_token_from_the_environment(
+    server: Callable[[Responder], tuple[int, _Counter]], api_token: str
+) -> None:
+    """The service refuses a post without it, so the client never sends one bare."""
+    port, counter = server(_accepts)
+    with ServiceClient(port=port) as client:
+        client.version()
+        client.post_event(_event())
+    assert counter.authorizations == [f"Bearer {api_token}"] * 2
+
+
+def test_an_explicit_token_wins_over_the_environment(
+    server: Callable[[Responder], tuple[int, _Counter]],
+) -> None:
+    port, counter = server(_accepts)
+    with ServiceClient(port=port, token="from-the-call") as client:
+        client.post_event(_event())
+    assert counter.authorizations == ["Bearer from-the-call"]
+
+
+def test_constructing_without_a_token_fails_naming_the_variable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failing before the first post beats sixty thousand 401s."""
+    monkeypatch.delenv(ENV_API_TOKEN)
+    with pytest.raises(RuntimeError, match=ENV_API_TOKEN):
+        ServiceClient(port=1)
 
 
 def test_a_drop_on_a_fresh_connection_is_not_retried(
