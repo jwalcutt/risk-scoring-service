@@ -23,6 +23,7 @@ Judgment calls this module fixes:
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -30,6 +31,8 @@ from typing import Any
 
 import pandas as pd
 import psycopg
+
+logger = logging.getLogger(__name__)
 
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 DATE_FORMAT = "%Y-%m-%d"
@@ -45,7 +48,23 @@ class MalformedEventError(ValueError):
 
 
 class EventConflictError(RuntimeError):
-    """A re-posted event matched an existing key with different field values."""
+    """A re-posted event matched an existing key with different field values.
+
+    Carries the table, the key the poster supplied, and the payload names
+    of the columns that differ. It never carries the stored or posted
+    values: the message travels back to the poster, and echoing the
+    stored row would let anyone who can guess a key read the record
+    behind it. The values go to the server log at the point of detection.
+    """
+
+    def __init__(self, table: str, key: Mapping[str, str], columns: Sequence[str]) -> None:
+        self.table = table
+        self.key = dict(key)
+        self.columns = tuple(columns)
+        super().__init__(
+            f"{table} key {self.key} already ingested with different values for "
+            f"{', '.join(self.columns)}"
+        )
 
 
 def _check_exact_format(value: str, fmt: str, label: str) -> None:
@@ -264,13 +283,19 @@ def _record(conn: psycopg.Connection[Any], spec: _TableSpec, values: dict[str, s
         if stored == values:
             conn.commit()
             return False
-        key = {name: values[name] for name in spec.key_columns}
-        diffs = ", ".join(
-            f"{name}: stored {stored[name]!r} != posted {values[name]!r}"
-            for name in spec.db_columns
-            if stored[name] != values[name]
+        payload_name = dict(zip(spec.db_columns, spec.frame_columns, strict=True))
+        key = {payload_name[name]: values[name] for name in spec.key_columns}
+        differing = [name for name in spec.db_columns if stored[name] != values[name]]
+        logger.warning(
+            "%s key %s already ingested with %s",
+            spec.table,
+            key,
+            ", ".join(
+                f"{payload_name[name]}: stored {stored[name]!r} != posted {values[name]!r}"
+                for name in differing
+            ),
         )
-        raise EventConflictError(f"{spec.table} key {key} already ingested with {diffs}")
+        raise EventConflictError(spec.table, key, [payload_name[name] for name in differing])
     except Exception:
         conn.rollback()
         raise
