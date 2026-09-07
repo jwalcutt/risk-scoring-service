@@ -24,6 +24,11 @@ Judgment calls this module fixes:
   already stored is a 409 naming the key and the differing columns,
   never the stored values, and a body over ``MAX_EVENT_BYTES`` is a 413.
   None of them is ever a silent drop.
+- ``POST /events`` requires the bearer token from
+  ``RISK_SCORING_API_TOKEN``. The check is a route dependency, so it
+  runs before the body is validated and an unauthenticated caller
+  learns nothing about the event schema. Startup reads the token the
+  way it loads the model: missing means the service does not start.
 - The size cap is enforced in ASGI middleware rather than in the handler,
   because FastAPI buffers the whole body to build the ``Event`` parameter
   before the handler runs. The middleware refuses on the declared
@@ -49,19 +54,19 @@ from pathlib import Path
 from typing import Any
 
 import mlflow
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from mlflow.exceptions import MlflowException
 from psycopg_pool import ConnectionPool, PoolTimeout
 from starlette.datastructures import Headers
-from starlette.exceptions import HTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from risk_scoring.cohort import COHORT_VERSION
 from risk_scoring.db import database_url
 from risk_scoring.features import FEATURE_VERSION
 from risk_scoring.payload_hash import payload_hash
+from risk_scoring.service.auth import ENV_API_TOKEN, authorized, require_api_token
 from risk_scoring.service.config import ServiceConfig
 from risk_scoring.service.events import Event, to_state_event
 from risk_scoring.service.ingest import IngestResult, ingest_event
@@ -188,14 +193,27 @@ def _open_pool(dsn: str, max_size: int) -> ConnectionPool[Any]:
     return pool
 
 
+async def require_bearer(request: Request) -> None:
+    """Refuse with 401 unless the request carries the token startup read."""
+    token: str = request.app.state.api_token
+    if not authorized(request.headers.get("authorization"), token):
+        raise HTTPException(
+            status_code=401,
+            detail=f"a bearer token matching {ENV_API_TOKEN} is required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
 def create_app(config: ServiceConfig, repo_root: Path, dsn: str | None = None) -> FastAPI:
     """Build the service app; the lifespan loads the model and opens the pool."""
     dsn = database_url() if dsn is None else dsn
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        api_token = require_api_token()
         model = _load_model(config, repo_root)
         pool = _open_pool(dsn, config.pool_size)
+        app.state.api_token = api_token
         app.state.model = model
         app.state.pool = pool
         app.state.config = config
@@ -264,7 +282,7 @@ def create_app(config: ServiceConfig, repo_root: Path, dsn: str | None = None) -
             "git_sha": git_sha,
         }
 
-    @app.post(EVENTS_PATH, status_code=202)
+    @app.post(EVENTS_PATH, status_code=202, dependencies=[Depends(require_bearer)])
     async def ingest(event: Event, request: Request) -> dict[str, Any]:
         raw_event = json.loads(await request.body())
         input_hash = payload_hash(raw_event)

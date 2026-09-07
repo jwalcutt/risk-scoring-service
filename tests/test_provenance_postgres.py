@@ -33,6 +33,7 @@ from risk_scoring import predictions, train
 from risk_scoring.populations import load_population
 from risk_scoring.provenance import recompute_input_hash, rescore, verify_predictions
 from risk_scoring.service.app import create_app
+from risk_scoring.service.auth import bearer_headers, require_api_token
 from risk_scoring.service.config import ServiceConfig
 from risk_scoring.stream import build_stream
 from risk_scoring.train import MODEL_NAME
@@ -56,7 +57,7 @@ def logged(
     """The whole population ingested through the service, as logged rows."""
     root, trained = trained_repo
     app = create_app(ServiceConfig(MODEL_NAME, trained.model_version), root, db_url)
-    with TestClient(app) as client:
+    with TestClient(app, headers=bearer_headers(require_api_token())) as client:
         for event in build_stream(population):
             response = client.post("/events", json=event)
             assert response.status_code == 202, response.text

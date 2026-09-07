@@ -39,6 +39,7 @@ from factories import make_encounter_row, make_patient_row, write_skew_populatio
 from risk_scoring import predictions, state, train
 from risk_scoring.cohort import build_cohort
 from risk_scoring.service.app import create_app
+from risk_scoring.service.auth import bearer_headers, require_api_token
 from risk_scoring.service.config import ServiceConfig
 from risk_scoring.stream import EVENT_FIELDS, build_stream
 from risk_scoring.train import MODEL_NAME
@@ -82,7 +83,7 @@ def serve(
     @contextmanager
     def instance(dsn: str) -> Iterator[TestClient]:
         app = create_app(ServiceConfig(MODEL_NAME, trained.model_version), root, dsn)
-        with TestClient(app) as client:
+        with TestClient(app, headers=bearer_headers(require_api_token())) as client:
             yield client
 
     return instance
@@ -245,4 +246,4 @@ def test_startup_holds_nothing_but_what_it_derives(
     with serve(db_url) as client:
         held = set(client.app.state._state)
 
-    assert held == {"model", "pool", "config", "git_sha"}
+    assert held == {"model", "pool", "config", "git_sha", "api_token"}

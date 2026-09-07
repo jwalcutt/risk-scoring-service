@@ -31,6 +31,7 @@ from risk_scoring.populations import load_population
 from risk_scoring.replay import clock, preload, release, runs
 from risk_scoring.replay.release import ScheduledLabel
 from risk_scoring.service.app import create_app
+from risk_scoring.service.auth import bearer_headers, require_api_token
 from risk_scoring.service.config import ServiceConfig
 from risk_scoring.stream import StreamEvent, ordered_events
 from risk_scoring.train import MODEL_NAME
@@ -123,7 +124,7 @@ def serving(trained_repo: tuple[Path, train.TrainingResult]) -> Serve:
     @contextmanager
     def instance(dsn: str) -> Iterator[TestClient]:
         app = create_app(ServiceConfig(MODEL_NAME, trained.model_version), root, dsn)
-        with TestClient(app) as client:
+        with TestClient(app, headers=bearer_headers(require_api_token())) as client:
             yield client
 
     return instance

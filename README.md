@@ -58,7 +58,13 @@ The service scores one event stream, in timestamp order, one event at a time. Th
 GIT_SHA=$(git rev-parse HEAD) docker compose up -d --build
 ```
 
-That starts Postgres, applies the schema through a one-shot migration service, and then serves on `http://localhost:8001`. Migrations are a separate service rather than part of the service's own start, so restarting the service never issues schema changes. The commit SHA is passed in because the image carries no `.git`, and the version endpoint reports it.
+That starts Postgres, applies the schema through a one-shot migration service, and then serves on `http://127.0.0.1:8001`. The port is published on loopback only, so the service is reachable from the host it runs on and from nowhere else. Migrations are a separate service rather than part of the service's own start, so restarting the service never issues schema changes. The commit SHA is passed in because the image carries no `.git`, and the version endpoint reports it.
+
+Posting an event requires a bearer token. The service reads it from `RISK_SCORING_API_TOKEN` at startup and refuses to start without one; every client in this repository (the replay harness, the batch scorer, the check scripts) reads the same variable and sends it as `Authorization: Bearer <token>`. Compose falls back to `dev-token` when the variable is unset, which is what lets the one-command stack above come up, and a `.env` file at the repository root or an exported variable overrides it. Set it once in the shell that runs the stack and the clients:
+
+```bash
+export RISK_SCORING_API_TOKEN=$(openssl rand -hex 32)
+```
 
 The service reads the model registry from the host through a bind mount, so one registry serves training, gating, and scoring. The registry database is mounted read-only; the artifact store is writable because MLflow rewrites a metadata file beside a model when it loads it, and [docs/service-notes.md](docs/service-notes.md) records what that mount trusts. Compose resolves the mount paths from the working directory, which is why the stack must be started from the repository root; any clone works without editing the file.
 
@@ -70,13 +76,13 @@ docker compose up -d postgres && python -m risk_scoring.db migrate && python -m 
 
 Postgres publishes on `127.0.0.1:5433`, so only processes on the machine can reach it, and the committed `risk`/`risk` credentials are the defaults for exactly that loopback-only stack. Anything else, such as a shared host or a port published on another interface, needs its own password. Put `POSTGRES_PASSWORD` in a `.env` file at the repository root, which git ignores, together with the matching `RISK_SCORING_DATABASE_URL` for the host-side commands above. Compose reads the file on its own. The host commands read the URL from the environment, so export it or source the file before running them.
 
-Startup loads the model version pinned in `configs/service.toml` from the MLflow registry and opens a connection pool. Either one failing stops the service from starting, so a 200 from the health endpoint means the service can actually score and store rather than that a process is alive. The pin must be an explicit registered version number: strings, aliases, and "latest" are rejected, and no code path resolves the newest version. The same file's `[database]` table sets `pool_size`, the most Postgres connections the service holds open at once; it defaults to 10 when the key is absent. A request that waits out the pool is answered with a 503 and should be posted again, which is safe because a re-posted event is a no-op.
+Startup reads the bearer token, loads the model version pinned in `configs/service.toml` from the MLflow registry, and opens a connection pool. Any of the three failing stops the service from starting, so a 200 from the health endpoint means the service can actually score and store rather than that a process is alive. The pin must be an explicit registered version number: strings, aliases, and "latest" are rejected, and no code path resolves the newest version. The same file's `[database]` table sets `pool_size`, the most Postgres connections the service holds open at once; it defaults to 10 when the key is absent. A request that waits out the pool is answered with a 503 and should be posted again, which is safe because a re-posted event is a no-op.
 
 | Endpoint | What it does |
 | --- | --- |
-| `GET /health` | Reports readiness. |
-| `GET /version` | Model name and version, feature-pipeline version, cohort version, and the serving commit's SHA. |
-| `POST /events` | Ingests one event and answers 202 with its input hash, plus the score and prediction id when the event was a discharge worth scoring. |
+| `GET /health` | Reports readiness. No token needed. |
+| `GET /version` | Model name and version, feature-pipeline version, cohort version, and the serving commit's SHA. No token needed. |
+| `POST /events` | Requires `Authorization: Bearer <token>` and answers 401 without it. Ingests one event and answers 202 with its input hash, plus the score and prediction id when the event was a discharge worth scoring. |
 
 An event is `{"event_type": "...", "payload": {...}}`, where the type is one of `patient`, `encounter`, `medication`, or `condition` and the payload carries the generator columns the shared modules read. Demographics must precede a patient's first discharge, because the cohort rules need a birthdate.
 

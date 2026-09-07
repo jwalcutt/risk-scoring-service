@@ -16,6 +16,21 @@ from psycopg import sql
 from factories import write_gate_population
 from risk_scoring import db as db_module
 from risk_scoring import train
+from risk_scoring.service.auth import ENV_API_TOKEN
+
+TEST_API_TOKEN = "test-token"
+
+
+@pytest.fixture(autouse=True)
+def api_token(monkeypatch: pytest.MonkeyPatch) -> str:
+    """The bearer token every in-process service and client reads from the environment.
+
+    Autouse, because the service refuses to start without one and the
+    client refuses to construct without one, and nearly every service
+    test builds both. A test about the unset case deletes the variable.
+    """
+    monkeypatch.setenv(ENV_API_TOKEN, TEST_API_TOKEN)
+    return TEST_API_TOKEN
 
 
 @pytest.fixture()

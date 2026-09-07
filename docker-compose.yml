@@ -59,6 +59,11 @@ services:
     working_dir: ${PWD}
     environment:
       RISK_SCORING_DATABASE_URL: *service-dsn
+      # POST /events refuses requests without this bearer token, and the
+      # service refuses to start without it. The default exists only so
+      # the documented one-command local stack still comes up; a .env file
+      # or the shell overrides it, and anything past a laptop must.
+      RISK_SCORING_API_TOKEN: ${RISK_SCORING_API_TOKEN:-dev-token}
     volumes:
       # The registry stays one store on the host. The database is read-only;
       # mlruns is not, because loading a models:/ URI rewrites a derived
@@ -69,7 +74,9 @@ services:
     ports:
       # Host port 8001, not 8000, so an app already listening on the usual
       # port never collides with the stack. Same reasoning as Postgres 5433.
-      - "${SERVICE_PORT:-8001}:8000"
+      # Bound to loopback: Docker publishes on 0.0.0.0 by default, which
+      # would offer the port to the whole network the host sits on.
+      - "127.0.0.1:${SERVICE_PORT:-8001}:8000"
     depends_on:
       migrate:
         condition: service_completed_successfully

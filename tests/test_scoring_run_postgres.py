@@ -21,6 +21,7 @@ from fastapi.testclient import TestClient
 from factories import write_skew_population
 from risk_scoring import predictions, scoring_run, train
 from risk_scoring.service.app import create_app
+from risk_scoring.service.auth import bearer_headers, require_api_token
 from risk_scoring.service.config import ServiceConfig
 from risk_scoring.train import MODEL_NAME
 
@@ -67,7 +68,7 @@ def run(
     app = create_app(ServiceConfig(MODEL_NAME, trained.model_version), root, db_url)
 
     def go(**overrides: Any) -> tuple[scoring_run.BatchRunResult, ClientPoster]:
-        with TestClient(app) as client:
+        with TestClient(app, headers=bearer_headers(require_api_token())) as client:
             poster = ClientPoster(client)
             options: dict[str, Any] = {
                 "cutoff": CUTOFF,
