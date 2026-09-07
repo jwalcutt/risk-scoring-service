@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from collections.abc import Callable, Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -248,3 +249,38 @@ def test_a_drop_on_a_fresh_connection_is_not_retried(
     with ServiceClient(port=port) as client, pytest.raises(ConnectionError):
         client.post_event(_event())
     assert counter.connections == 1
+
+
+class _Stalls:
+    """A responder that holds the requests named past the client's timeout."""
+
+    def __init__(self, *, on: set[int], seconds: float) -> None:
+        self.on = on
+        self.seconds = seconds
+        self.seen = 0
+
+    def __call__(self, path: str, body: str) -> tuple[int, dict[str, Any]]:
+        self.seen += 1
+        if self.seen in self.on:
+            time.sleep(self.seconds)
+            return _DROP, {}
+        return _accepts(path, body)
+
+
+def test_a_post_after_a_timeout_reconnects_instead_of_reusing_the_stalled_socket(
+    server: Callable[[Responder], tuple[int, _Counter]],
+) -> None:
+    """A timeout leaves the kept-alive connection waiting on a reply.
+
+    A caller that catches the timeout and posts again must get a fresh
+    connection, not http.client.CannotSendRequest from the one still
+    parked mid-request. The timeout itself is not retried; whether to
+    post again is up to the caller.
+    """
+    port, counter = server(_Stalls(on={2}, seconds=1.0))
+    with ServiceClient(port=port, timeout=0.2) as client:
+        client.post_event(_event())
+        with pytest.raises(TimeoutError):
+            client.post_event(_event())
+        assert client.post_event(_event())["input_hash"] == "abc"
+    assert counter.connections == 2
