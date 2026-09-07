@@ -13,8 +13,8 @@ over its own throwaway database:
 The pause points are the same kinds the restart test uses: before the
 first event, after it, mid-stream, before and after a discharge, after
 the last event, plus the instant a label would be released (a discharge
-plus 30 simulated days), so the labels substep can add its table to this
-comparison without moving the points.
+plus 30 simulated days), so the labels table joined this comparison
+later without moving the points.
 
 ``prediction_id`` and ``scored_at`` are excluded from every comparison.
 The database assigns both, and a bigserial consumes a value even when the

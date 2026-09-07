@@ -40,9 +40,8 @@ from replay_support import (
     stream_of,
 )
 from risk_scoring import label_log, state, train
-from risk_scoring.cohort import build_cohort
-from risk_scoring.labels import LABEL_VERSION, READMISSION_WINDOW_DAYS, build_labels
-from risk_scoring.replay import clock, harness, runs
+from risk_scoring.labels import LABEL_VERSION, READMISSION_WINDOW_DAYS
+from risk_scoring.replay import audit, clock, harness, runs
 from risk_scoring.replay.release import ScheduledLabel
 from risk_scoring.stream import StreamEvent
 
@@ -93,23 +92,6 @@ def _replay(
         )
 
 
-def _batch_labels(frames: dict[str, pd.DataFrame]) -> dict[str, int]:
-    cohort = build_cohort(frames["encounters"], frames["patients"]).frame
-    labelled = build_labels(cohort, frames["encounters"])
-    return dict(zip(labelled["encounter_id"], labelled["label"].astype(int), strict=True))
-
-
-def _early_labels(dsn: str) -> int:
-    """The end-to-end run's never-early query, restated here."""
-    with psycopg.connect(dsn, connect_timeout=2) as conn:
-        row = conn.execute(
-            "SELECT count(*) FROM labels l JOIN predictions p USING (prediction_id)"
-            " WHERE l.released_at < p.event_time + interval '30 days'"
-        ).fetchone()
-    assert row is not None
-    return int(row[0])
-
-
 # The skew population
 
 
@@ -123,7 +105,7 @@ def test_every_released_label_is_the_batch_label_for_its_discharge(
     prepare(db_url, frames, events)
     _replay(serve, db_url, events, schedule)
 
-    batch = _batch_labels(frames)
+    batch = audit.batch_labels(frames)
     with psycopg.connect(db_url, connect_timeout=2) as conn:
         released = label_log.all_labels(conn)
     assert released
@@ -144,7 +126,8 @@ def test_no_label_is_released_before_its_discharge_is_thirty_days_old(
     prepare(db_url, frames, events)
     _replay(serve, db_url, events, schedule)
 
-    assert _early_labels(db_url) == 0
+    with psycopg.connect(db_url, connect_timeout=2) as conn:
+        assert audit.early_labels(conn) == 0
     with psycopg.connect(db_url, connect_timeout=2) as conn:
         rows = conn.execute(
             "SELECT p.event_time, l.due_at, l.released_at"
@@ -271,4 +254,5 @@ def test_a_readmission_on_day_29_has_no_label_on_day_29_and_one_on_day_30(
     # The readmission stays were scored too; their own labels fall due after the end.
     assert len(read_log(dsn)) == 6
     assert (finished.labels_released, finished.labels_pending) == (3, 3)
-    assert _early_labels(dsn) == 0
+    with psycopg.connect(dsn, connect_timeout=2) as conn:
+        assert audit.early_labels(conn) == 0

@@ -30,7 +30,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 import pandas as pd
 
@@ -66,19 +66,25 @@ def ordered_events(
     encounters: pd.DataFrame, medications: pd.DataFrame, conditions: pd.DataFrame
 ) -> list[StreamEvent]:
     """Interleave every clinical row into one timestamp-ordered stream."""
-    events = [
-        StreamEvent(at=row["STOP"], kind="encounter", row=dict(row))
-        for _, row in encounters.iterrows()
+    events = [StreamEvent(at=row["STOP"], kind="encounter", row=row) for row in _rows(encounters)]
+    events += [
+        StreamEvent(at=row["START"], kind="medication", row=row) for row in _rows(medications)
     ]
     events += [
-        StreamEvent(at=row["START"], kind="medication", row=dict(row))
-        for _, row in medications.iterrows()
-    ]
-    events += [
-        StreamEvent(at=f"{row['START']}T00:00:00Z", kind="condition", row=dict(row))
-        for _, row in conditions.iterrows()
+        StreamEvent(at=f"{row['START']}T00:00:00Z", kind="condition", row=row)
+        for row in _rows(conditions)
     ]
     return sorted(events, key=lambda event: event.sort_key)
+
+
+def _rows(frame: pd.DataFrame) -> list[dict[str, str]]:
+    """Every row as its own dictionary of verbatim strings.
+
+    ``to_dict("records")`` is an order of magnitude faster than ``iterrows``
+    over the million-row exports and yields the same dictionaries, since
+    the population reader loads every column as text.
+    """
+    return cast(list[dict[str, str]], frame.to_dict("records"))
 
 
 def envelope(kind: str, row: Mapping[str, str]) -> dict[str, Any]:
@@ -92,7 +98,7 @@ def envelope(kind: str, row: Mapping[str, str]) -> dict[str, Any]:
 
 def build_stream(frames: Mapping[str, pd.DataFrame]) -> list[dict[str, Any]]:
     """The whole population as posted event envelopes, demographics first."""
-    stream = [envelope("patient", dict(row)) for _, row in frames["patients"].iterrows()]
+    stream = [envelope("patient", row) for row in _rows(frames["patients"])]
     stream += [
         envelope(item.kind, item.row)
         for item in ordered_events(

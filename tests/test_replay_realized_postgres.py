@@ -14,14 +14,10 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
 
-import mlflow
-import numpy as np
 import pandas as pd
 import psycopg
 import pytest
-from sklearn.metrics import roc_auc_score
 
 from replay_support import (
     END,
@@ -36,14 +32,11 @@ from replay_support import (
     stream_of,
 )
 from risk_scoring import train
-from risk_scoring.cohort import build_cohort
-from risk_scoring.features import MODEL_INPUT_COLUMNS, build_features
-from risk_scoring.labels import READMISSION_WINDOW_DAYS, build_labels
-from risk_scoring.replay import harness, runs
+from risk_scoring.labels import READMISSION_WINDOW_DAYS
+from risk_scoring.replay import audit, harness, runs
 from risk_scoring.replay.realized import RealizedPerformance, realized_performance
 from risk_scoring.replay.release import ScheduledLabel
 from risk_scoring.stream import StreamEvent
-from risk_scoring.tracking import configure_tracking
 from risk_scoring.train import MODEL_NAME
 
 pytestmark = pytest.mark.db
@@ -92,38 +85,16 @@ def _realized(dsn: str, start: datetime, end: datetime) -> RealizedPerformance:
         return realized_performance(conn, start, end)
 
 
-def _batch(
-    frames: dict[str, pd.DataFrame],
-    trained_repo: tuple[Path, train.TrainingResult],
-    start: datetime,
-    end: datetime,
-) -> tuple[int, float, float]:
-    """Count, prevalence, and AUROC from the modules training uses, over one window."""
-    root, trained = trained_repo
-    cohort = build_cohort(frames["encounters"], frames["patients"]).frame
-    stop = cohort["stop"]
-    window = cohort.loc[(stop >= start) & (stop < end)].reset_index(drop=True)
-    labels = build_labels(window, frames["encounters"])
-    features = build_features(
-        window, frames["encounters"], frames["medications"], frames["conditions"]
-    )
-    x = features.loc[:, list(MODEL_INPUT_COLUMNS)].astype("float64")
-    configure_tracking(root)
-    model: Any = mlflow.pyfunc.load_model(f"models:/{MODEL_NAME}/{trained.model_version}")
-    scores = np.asarray(model.predict(x), dtype=float)
-    y = labels["label"].to_numpy(dtype=float)
-    return len(y), float(y.mean()), float(roc_auc_score(y, scores))
-
-
 def test_the_join_reconstructs_the_batch_pipelines_metrics_exactly(
     replayed: str,
     frames: dict[str, pd.DataFrame],
     trained_repo: tuple[Path, train.TrainingResult],
 ) -> None:
-    count, prevalence, auroc = _batch(frames, trained_repo, START, LABELLED_END)
-    realized = _realized(replayed, START, LABELLED_END)
-    assert count == 5
-    assert realized == RealizedPerformance(count=count, prevalence=prevalence, auroc=auroc)
+    root, trained = trained_repo
+    model = audit.LoggedModel(MODEL_NAME, trained.model_version)
+    batch = audit.batch_performance(frames, model, START, LABELLED_END, repo_root=root)
+    assert batch.count == 5
+    assert _realized(replayed, START, LABELLED_END) == batch
 
 
 def test_a_window_reaching_past_the_labelled_span_counts_only_labelled_discharges(

@@ -102,6 +102,25 @@ def test_open_run_ignores_finished_runs(db_conn: psycopg.Connection[Any]) -> Non
     assert runs.open_run(db_conn) is None
 
 
+def test_latest_run_is_none_on_an_empty_database(db_conn: psycopg.Connection[Any]) -> None:
+    assert runs.latest_run(db_conn) is None
+
+
+def test_latest_run_is_the_newest_row_whatever_its_status(
+    db_conn: psycopg.Connection[Any],
+) -> None:
+    """An audit after a finished run needs its row, which open_run no longer returns."""
+    first = _create(db_conn)
+    runs.set_status(db_conn, first.run_id, "finished")
+    second = _create(db_conn)
+    found = runs.latest_run(db_conn)
+    assert found is not None and found.run_id == second.run_id
+    runs.set_status(db_conn, second.run_id, "finished")
+    finished = runs.latest_run(db_conn)
+    assert finished is not None
+    assert (finished.run_id, finished.status) == (second.run_id, "finished")
+
+
 def test_checkpoint_writes_sim_now_and_the_cursor(db_conn: psycopg.Connection[Any]) -> None:
     run = _create(db_conn)
     cursor = ("2025-01-02T13:00:00Z", 2, "[('Id', 'e-1'), ('STOP', '2025-01-02T13:00:00Z')]")
