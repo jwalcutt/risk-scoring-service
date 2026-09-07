@@ -24,6 +24,7 @@ The rules these tests pin:
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -298,6 +299,29 @@ def test_rejected_event_writes_nothing(client: TestClient, conn: psycopg.Connect
     assert bad.status_code == 422
     assert _prediction_count(conn) == 0
     assert len(state.patient_history(conn, "patient-1").encounters) == 0
+
+
+def test_conflict_response_names_the_column_and_logs_the_values(
+    client: TestClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A 409 tells the poster which field conflicts; the stored value is for the log only."""
+    _post(client, _patient())
+    _post(client, _discharge())
+
+    with caplog.at_level(logging.WARNING):
+        conflict = client.post("/events", json=_discharge(STOP="2024-05-05T17:30:00Z"))
+
+    assert conflict.status_code == 409
+    detail = conflict.json()["detail"]
+    assert "encounter-1" in detail
+    assert "STOP" in detail
+    assert "2024-05-04T17:30:00Z" not in detail
+    assert "2024-05-05T17:30:00Z" not in detail
+
+    logged = "\n".join(r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
+    assert "encounter-1" in logged
+    assert "2024-05-04T17:30:00Z" in logged
+    assert "2024-05-05T17:30:00Z" in logged
 
 
 def test_divergent_repost_is_rejected_and_leaves_the_first_score_standing(

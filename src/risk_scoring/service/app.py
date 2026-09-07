@@ -20,7 +20,8 @@ Judgment calls this module fixes:
 - Every way an event can be refused is a 4xx: a bad shape is FastAPI's
   422, a bad field format is the same 422 raised from the state layer, a
   discharge arriving before its patient's demographics is a 422 naming
-  the patient, and an event contradicting one already stored is a 409.
+  the patient, and an event contradicting one already stored is a 409
+  naming the key and the differing columns, never the stored values.
   None of them is ever a silent drop.
 """
 
@@ -138,8 +139,25 @@ def create_app(config: ServiceConfig, repo_root: Path, dsn: str | None = None) -
 
     @app.exception_handler(EventConflictError)
     async def event_conflict(request: Request, exc: Exception) -> JSONResponse:
-        """Two contradicting versions of one event is a conflict, not a merge."""
-        return JSONResponse(status_code=409, content={"detail": str(exc)})
+        """Two contradicting versions of one event is a conflict, not a merge.
+
+        The body is built from the exception's fields, so what reaches the
+        poster is exactly the key it supplied and the names of the columns
+        that differ. The stored and posted values are in the server log,
+        written where the conflict was detected.
+        """
+        assert isinstance(exc, EventConflictError)
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": (
+                    f"{exc.table} key {exc.key} already ingested with different values for "
+                    f"{', '.join(exc.columns)}"
+                ),
+                "key": exc.key,
+                "columns": list(exc.columns),
+            },
+        )
 
     @app.get("/health")
     async def health() -> dict[str, str]:

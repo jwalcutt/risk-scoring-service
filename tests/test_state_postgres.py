@@ -8,6 +8,7 @@ serving-time feature recompute rides on.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Mapping
 from typing import Any
 
@@ -177,6 +178,38 @@ def test_repost_divergent_event_raises_conflict(
         "condition": state.CONDITION_COLUMNS,
     }[label]
     pd.testing.assert_frame_equal(stored, _frame([row], expected_columns))
+
+
+def test_conflict_error_names_the_column_but_not_the_stored_value(
+    db_conn: psycopg.Connection[Any], caplog: pytest.LogCaptureFixture
+) -> None:
+    """The exception is what the poster hears; the values it contradicts stay server-side."""
+    _record(db_conn, "encounter", make_encounter_row(ENCOUNTERCLASS="emergency"))
+
+    with (
+        caplog.at_level(logging.WARNING, logger="risk_scoring.state"),
+        pytest.raises(state.EventConflictError) as excinfo,
+    ):
+        _record(db_conn, "encounter", make_encounter_row(ENCOUNTERCLASS="inpatient"))
+
+    error = excinfo.value
+    assert error.table == "encounters"
+    assert error.key == {"Id": "encounter-1"}
+    assert error.columns == ("ENCOUNTERCLASS",)
+    message = str(error)
+    assert "encounters" in message
+    assert "encounter-1" in message
+    assert "ENCOUNTERCLASS" in message
+    assert "emergency" not in message
+    assert "inpatient" not in message
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    logged = warnings[0].getMessage()
+    assert "encounter-1" in logged
+    assert "ENCOUNTERCLASS" in logged
+    assert "emergency" in logged
+    assert "inpatient" in logged
 
 
 def test_connection_usable_after_conflict(db_conn: psycopg.Connection[Any]) -> None:
