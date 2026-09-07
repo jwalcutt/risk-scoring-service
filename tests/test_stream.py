@@ -108,6 +108,53 @@ def test_rows_arriving_at_one_instant_are_ordered_deterministically() -> None:
     ]
 
 
+def test_an_open_stay_arrives_after_every_timestamped_event() -> None:
+    """A stay with no discharge yet has no arrival instant, so nothing may follow it."""
+    open_stay = make_encounter_row(Id="open", START="2020-01-01T08:00:00Z", STOP="")
+    discharge = make_encounter_row(Id="closed", STOP="2024-06-01T00:00:00Z")
+    medication = make_medication_row(START="2025-01-01T00:00:00Z")
+    condition = make_condition_row(START="2025-06-01")
+    events = ordered_events(*_frames([open_stay, discharge], [medication], [condition]))
+    assert [event.kind for event in events] == ["encounter", "medication", "condition", "encounter"]
+    assert events[-1].row["Id"] == "open"
+
+
+def test_open_stays_are_ordered_by_admission_among_themselves() -> None:
+    """Ids are chosen to sort the other way, so the order can only come from START."""
+    later = make_encounter_row(Id="a-admitted-later", START="2024-03-01T08:00:00Z", STOP="")
+    earlier = make_encounter_row(Id="z-admitted-earlier", START="2024-02-01T08:00:00Z", STOP="")
+    events = ordered_events(*_frames([later, earlier], [], []))
+    assert [event.row["Id"] for event in events] == ["z-admitted-earlier", "a-admitted-later"]
+
+
+def test_open_stays_admitted_at_one_instant_are_ordered_deterministically() -> None:
+    first = make_encounter_row(Id="a", START="2024-02-01T08:00:00Z", STOP="")
+    second = make_encounter_row(Id="b", START="2024-02-01T08:00:00Z", STOP="")
+    forward = ordered_events(*_frames([first, second], [], []))
+    reversed_input = ordered_events(*_frames([second, first], [], []))
+    assert [event.row["Id"] for event in forward] == ["a", "b"]
+    assert [event.row["Id"] for event in reversed_input] == ["a", "b"]
+
+
+def test_an_export_without_open_stays_keeps_its_arrival_sequence() -> None:
+    """Replays are byte-identical run to run; the open-stay rule must not touch closed rows."""
+    encounters = [
+        make_encounter_row(Id="e-late", START="2024-05-30T08:00:00Z", STOP="2024-06-01T00:00:00Z"),
+        make_encounter_row(Id="e-early", START="2023-12-30T08:00:00Z", STOP="2024-01-02T00:00:00Z"),
+    ]
+    medications = [make_medication_row(START="2024-01-02T00:00:00Z", CODE="m")]
+    conditions = [make_condition_row(START="2024-06-01", CODE="c")]
+    events = ordered_events(*_frames(encounters, medications, conditions))
+    assert [(event.at, event.kind) for event in events] == [
+        ("2024-01-02T00:00:00Z", "medication"),
+        ("2024-01-02T00:00:00Z", "encounter"),
+        ("2024-06-01T00:00:00Z", "condition"),
+        ("2024-06-01T00:00:00Z", "encounter"),
+    ]
+    discharges = [event.row["Id"] for event in events if event.kind == "encounter"]
+    assert discharges == ["e-early", "e-late"]
+
+
 def test_empty_population_yields_no_events() -> None:
     assert ordered_events(*_frames([], [], [])) == []
 

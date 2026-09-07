@@ -14,6 +14,12 @@ Judgment calls it fixes:
   discharge date in front of that day's discharge, matching how the
   feature module judges condition activity against the date rather than
   the instant.
+- A stay still open at export time, an encounter with an empty STOP, has
+  no discharge and so no arrival instant. Its key sorts after every
+  timestamped event, and open stays sort among themselves by START and
+  then the row tie-break. The batch stream posts them last; a replay clock
+  never reaches one, so the replay neither preloads nor posts it, the
+  same as an event dated past the run's end.
 - Demographics lead the stream, unordered. The cohort rules need a
   birthdate, so a discharge that outran its patient is refused rather than
   scored.
@@ -40,6 +46,10 @@ from risk_scoring import state
 # effect during it, so they reach the service before that discharge.
 _KIND_ORDER = {"medication": 0, "condition": 1, "encounter": 2}
 
+# Every timestamp begins with a digit, so a key behind this prefix sorts
+# after all of them while still ordering open stays by their START.
+_OPEN_STAY_PREFIX = "open:"
+
 EVENT_FIELDS: dict[str, tuple[str, ...]] = {
     "patient": state.PATIENT_COLUMNS,
     "encounter": state.ENCOUNTER_COLUMNS,
@@ -50,7 +60,11 @@ EVENT_FIELDS: dict[str, tuple[str, ...]] = {
 
 @dataclass(frozen=True)
 class StreamEvent:
-    """One ingestion event and the simulated instant it arrives at."""
+    """One ingestion event and the simulated instant it arrives at.
+
+    ``at`` is a timestamp in the stream's format for every event except an
+    open stay, whose key sorts after every timestamp; see the module notes.
+    """
 
     at: str
     kind: str
@@ -66,7 +80,10 @@ def ordered_events(
     encounters: pd.DataFrame, medications: pd.DataFrame, conditions: pd.DataFrame
 ) -> list[StreamEvent]:
     """Interleave every clinical row into one timestamp-ordered stream."""
-    events = [StreamEvent(at=row["STOP"], kind="encounter", row=row) for row in _rows(encounters)]
+    events = [
+        StreamEvent(at=_encounter_arrival(row), kind="encounter", row=row)
+        for row in _rows(encounters)
+    ]
     events += [
         StreamEvent(at=row["START"], kind="medication", row=row) for row in _rows(medications)
     ]
@@ -75,6 +92,11 @@ def ordered_events(
         for row in _rows(conditions)
     ]
     return sorted(events, key=lambda event: event.sort_key)
+
+
+def _encounter_arrival(row: Mapping[str, str]) -> str:
+    """A discharge arrives at its STOP; an open stay keys after every instant, by START."""
+    return row["STOP"] if row["STOP"] else f"{_OPEN_STAY_PREFIX}{row['START']}"
 
 
 def _rows(frame: pd.DataFrame) -> list[dict[str, str]]:
