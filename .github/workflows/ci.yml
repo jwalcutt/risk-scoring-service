@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
 
+# The jobs only read the checkout. Nothing here writes to the repository,
+# so the token gets no more than that.
+permissions:
+  contents: read
+
 jobs:
   checks:
     runs-on: ubuntu-latest
@@ -35,6 +40,32 @@ jobs:
 
       - name: Install dependencies
         run: uv sync --locked
+
+      # Audits every pin in uv.lock against the PyPI advisory database and
+      # fails the build on any hit that is not listed below. The export drops
+      # the editable project entry, which pip-audit cannot resolve, and the
+      # audit runs without pip, so the lock is checked exactly as written for
+      # the Python version it targets instead of being re-resolved.
+      #
+      # Each ignored advisory needs a reason here and an issue tracking it.
+      - name: Audit dependencies (pip-audit)
+        run: |
+          uv export --no-hashes --frozen --no-emit-project -o requirements-audit.txt
+          uvx pip-audit==2.10.1 -r requirements-audit.txt --no-deps --disable-pip \
+            --progress-spinner off \
+            --ignore-vuln CVE-2026-69247 \
+            --ignore-vuln CVE-2026-71211
+        # CVE-2026-69247 (PYSEC-2026-3552, GHSA-g6cj-pr64-35w5): cryptography
+        # 49.0.0 leaks a Bleichenbacher oracle from PKCS#7 decryption. Nothing
+        # in this repository decrypts PKCS#7. The fix is 50.0.0, and mlflow
+        # 3.15.x pins cryptography below 50, so the bump waits on the mlflow
+        # upgrade that #18 tracks.
+        #
+        # CVE-2026-71211 (GHSA-h7x2-h6g9-p789): mlflow 3.13.0 through 3.15.2
+        # accepts an unvalidated api_base when creating a gateway secret and
+        # will proxy to it (SSRF). No release fixes it; 3.16.0 ships the same
+        # handler. This repository never runs the AI gateway and only serves
+        # the tracking UI on loopback. Tracked in #18.
 
       - name: Lint (ruff check)
         run: uv run ruff check src tests scripts
