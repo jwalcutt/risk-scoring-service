@@ -21,6 +21,10 @@ The rules these tests pin:
   loudly rather than scored or silently skipped, and the refusal stores
   nothing, so the 4xx means what it says. Re-posting the discharge after
   the demographics arrive scores it.
+- A patient id that has reached the configured event cap gets a 409 for
+  any further new clinical event, which is stored nowhere; re-posts of
+  what it already holds stay no-ops, other patients are unaffected, and
+  demographics never count.
 """
 
 from __future__ import annotations
@@ -423,3 +427,71 @@ def test_divergent_repost_is_rejected_and_leaves_the_first_score_standing(
     assert stored is not None
     assert stored.event_time == datetime(2024, 5, 4, 17, 30, tzinfo=UTC)
     assert _prediction_count(conn) == 1
+
+
+# --- the per-patient event cap ---
+
+
+@pytest.fixture()
+def capped_client(
+    trained_repo: tuple[Path, train.TrainingResult], db_url: str
+) -> Iterator[TestClient]:
+    """A service that lets each patient hold two clinical events."""
+    root, trained = trained_repo
+    config = ServiceConfig(MODEL_NAME, trained.model_version, max_events_per_patient=2)
+    app = create_app(config, root, db_url)
+    with TestClient(app, headers=bearer_headers(require_api_token())) as test_client:
+        yield test_client
+
+
+def _medication(code: str, patient: str = "patient-1") -> dict[str, object]:
+    row = make_medication_row(PATIENT=patient, ENCOUNTER="encounter-1", CODE=code)
+    return _event("medication", row, MEDICATION_FIELDS)
+
+
+def test_events_past_the_patient_cap_are_refused_with_409_and_stored_nowhere(
+    capped_client: TestClient, conn: psycopg.Connection[Any]
+) -> None:
+    _post(capped_client, _patient())
+    _post(capped_client, _medication("drug-1"))
+    _post(capped_client, _medication("drug-2"))
+
+    refused = capped_client.post("/events", json=_medication("drug-3"))
+
+    assert refused.status_code == 409
+    assert refused.headers["content-type"].startswith("application/json")
+    assert "patient-1" in refused.json()["detail"]
+    assert "2" in refused.json()["detail"]
+    assert state.patient_history(conn, "patient-1").medications["CODE"].tolist() == [
+        "drug-1",
+        "drug-2",
+    ]
+
+
+def test_a_repost_at_the_cap_is_accepted_and_other_patients_are_unaffected(
+    capped_client: TestClient, conn: psycopg.Connection[Any]
+) -> None:
+    _post(capped_client, _patient())
+    _post(capped_client, _medication("drug-1"))
+    _post(capped_client, _medication("drug-2"))
+
+    repost = _post(capped_client, _medication("drug-2"))
+    other = _post(capped_client, _medication("drug-1", patient="patient-2"))
+
+    assert repost["scored"] is False
+    assert other["scored"] is False
+    assert len(state.patient_history(conn, "patient-2").medications) == 1
+
+
+def test_a_discharge_at_the_cap_is_refused_before_it_can_be_scored(
+    capped_client: TestClient, conn: psycopg.Connection[Any]
+) -> None:
+    _post(capped_client, _patient())
+    _post(capped_client, _medication("drug-1"))
+    _post(capped_client, _medication("drug-2"))
+
+    refused = capped_client.post("/events", json=_discharge())
+
+    assert refused.status_code == 409
+    assert _prediction_count(conn) == 0
+    assert state.patient_history(conn, "patient-1").encounters.empty

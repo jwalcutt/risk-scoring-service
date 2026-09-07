@@ -9,6 +9,9 @@ The rules these tests pin:
 - A missing [model] table or missing key fails loudly, never defaults.
 - The committed configs/service.toml parses, and its model name matches
   the registry name training uses, so the two cannot drift.
+- The per-patient event cap is read from [limits] when present, falls
+  back to the module default when the table is absent, and is rejected
+  when it is not a positive integer.
 """
 
 from __future__ import annotations
@@ -17,7 +20,11 @@ from pathlib import Path
 
 import pytest
 
-from risk_scoring.service.config import ServiceConfig, load_config
+from risk_scoring.service.config import (
+    DEFAULT_MAX_EVENTS_PER_PATIENT,
+    ServiceConfig,
+    load_config,
+)
 from risk_scoring.train import MODEL_NAME
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -107,3 +114,31 @@ def test_pool_size_must_be_a_positive_integer(tmp_path: Path, pool_size: str) ->
 def test_committed_config_pins_the_pool_size() -> None:
     config = load_config(_REPO_ROOT / "configs" / "service.toml")
     assert config.pool_size == 10
+
+
+# --- the per-patient event cap ---
+
+MODEL_TABLE = '[model]\nname = "readmission-risk"\nversion = 3\n'
+
+
+def test_event_cap_is_read_from_the_limits_table(tmp_path: Path) -> None:
+    path = _write(tmp_path, MODEL_TABLE + "[limits]\nmax_events_per_patient = 500\n")
+    assert load_config(path).max_events_per_patient == 500
+
+
+def test_event_cap_defaults_when_the_limits_table_is_absent(tmp_path: Path) -> None:
+    path = _write(tmp_path, MODEL_TABLE)
+    assert load_config(path).max_events_per_patient == DEFAULT_MAX_EVENTS_PER_PATIENT
+
+
+@pytest.mark.parametrize("value", ["0", "-5", "true", '"500"', "2.5"])
+def test_event_cap_must_be_a_positive_integer(tmp_path: Path, value: str) -> None:
+    path = _write(tmp_path, MODEL_TABLE + f"[limits]\nmax_events_per_patient = {value}\n")
+    with pytest.raises(ValueError, match="max_events_per_patient"):
+        load_config(path)
+
+
+def test_committed_event_cap_clears_every_generated_patient_by_a_wide_margin() -> None:
+    """The largest patient recorded in docs/service-notes.md posted 826 events."""
+    config = load_config(_REPO_ROOT / "configs" / "service.toml")
+    assert config.max_events_per_patient >= 10 * 826

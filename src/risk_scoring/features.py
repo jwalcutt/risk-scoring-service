@@ -64,9 +64,19 @@ Judgment calls this module fixes:
 - Patient-level lifetime aggregates (HEALTHCARE_EXPENSES,
   HEALTHCARE_COVERAGE, INCOME) and DEATHDATE are never features: all
   four encode information from beyond the scoring instant.
+- ``ENCOUNTER_LOOKBACK_DAYS`` states how far back the encounter features
+  read, so serving can leave older rows unread. A prior encounter whose
+  STOP precedes the admission START by more than the cap either sets a
+  gap that clips to the cap, which is the no-history sentinel, or sets
+  nothing at all, and it lies outside the 180-day window that ends at the
+  later discharge instant. Medications and conditions carry no such
+  bound: a resolved condition from any year still sets its comorbidity
+  flag.
 """
 
 from __future__ import annotations
+
+import math
 
 import numpy as np
 import pandas as pd
@@ -80,6 +90,14 @@ DATE_FORMAT = "%Y-%m-%d"
 DAYS_SINCE_PREV_DISCHARGE_CAP = 365.0
 
 WINDOW_DAYS = 180
+
+ENCOUNTER_LOOKBACK_DAYS = max(WINDOW_DAYS, math.ceil(DAYS_SINCE_PREV_DISCHARGE_CAP))
+"""Days before the admission START beyond which no prior encounter affects a feature.
+
+The 180-day counts end at the discharge STOP and the gap runs from the
+admission START, and START is never after STOP, so the longer of the two
+spans measured from START covers both.
+"""
 
 FEATURE_COLUMNS = (
     "encounter_id",

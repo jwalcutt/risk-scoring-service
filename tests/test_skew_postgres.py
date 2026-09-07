@@ -6,6 +6,11 @@ features from persisted state at the moment that discharge arrives. Both
 paths must produce byte-identical feature values. The assertion is exact
 equality, never a tolerance: a feature that differs by a rounding step
 between training and serving is still a skew bug.
+
+The serving path reads state through the same history window the
+service scores from, so this is also the proof that the window drops
+nothing a feature reads: the population carries rows one second to
+either side of each bound.
 """
 
 from __future__ import annotations
@@ -39,9 +44,13 @@ def _replay(conn: psycopg.Connection[Any], frames: dict[str, pd.DataFrame]) -> p
         if event.kind == "condition":
             state.record_condition(conn, state.ConditionEvent.from_row(event.row))
             continue
-        state.record_encounter(conn, state.EncounterEvent.from_row(event.row))
-        history = state.patient_history(conn, event.row["PATIENT"])
-        result = serving.serving_features(history, event.row["Id"])
+        encounter = state.EncounterEvent.from_row(event.row)
+        state.record_encounter(conn, encounter)
+        window = serving.history_window(encounter)
+        if window is None:
+            continue
+        history = state.patient_history(conn, encounter.patient, window)
+        result = serving.serving_features(history, encounter.id)
         if result is not None:
             scored.append(result.features)
 
@@ -76,7 +85,7 @@ def test_population_exercises_the_boundaries_it_claims(
     """Guard the fixture: a population that collapses would make the skew test vacuous."""
     batch = _batch_features(skew_frames).set_index("encounter_id")
 
-    assert len(batch) == 13
+    assert len(batch) == 19
     assert batch.loc["e-fresh", "days_since_prev_discharge"] == 365.0
     assert batch.loc["e-fresh", "prior_inpatient_180d"] == 0
     assert batch.loc["e-edge-index", "prior_inpatient_180d"] == 1
@@ -88,11 +97,17 @@ def test_population_exercises_the_boundaries_it_claims(
     assert batch.loc["e-twin-b", "prior_inpatient_180d"] == 1
     assert batch.loc["e-twin-a", "days_since_prev_discharge"] == 9.0
     assert batch.loc["e-twin-b", "days_since_prev_discharge"] == 11.0
-    assert batch.loc["e-full-index", "active_medication_count"] == 3
+    assert batch.loc["e-full-index", "active_medication_count"] == 5
     assert batch.loc["e-full-index", "active_disorder_count"] == 4
     assert batch.loc["e-full-index", "flag_chf"] == 1
     assert batch.loc["e-full-index", "flag_mi"] == 1
     assert batch.loc["e-full-index", "flag_malignancy"] == 1
+    # One second inside the lookback the gap is a hair under the cap; on it
+    # and one second beyond it the gap is the cap, which is also the sentinel.
+    assert 364.99 < batch.loc["e-floor-in-index", "days_since_prev_discharge"] < 365.0
+    assert batch.loc["e-floor-on-index", "days_since_prev_discharge"] == 365.0
+    assert batch.loc["e-floor-out-index", "days_since_prev_discharge"] == 365.0
+    assert batch.loc["e-floor-out-index", "prior_ed_180d"] == 0
 
 
 def test_serving_features_equal_training_features_exactly(
@@ -102,7 +117,7 @@ def test_serving_features_equal_training_features_exactly(
     served = _sorted_by_encounter(_replay(db_conn, skew_frames))
 
     assert served["encounter_id"].tolist() == batch["encounter_id"].tolist()
-    assert len(served) == 13
+    assert len(served) == 19
     pd.testing.assert_frame_equal(served, batch, check_exact=True)
 
 

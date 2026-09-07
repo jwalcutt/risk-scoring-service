@@ -35,17 +35,36 @@ Judgment calls this module fixes:
   reporting, never a reason to skip the score. The check is a public
   function so the ingestion path can run it before the discharge is
   written, and refuse without storing anything.
+- ``history_window`` narrows what state reads for one discharge to the
+  rows its features can see, so a patient's lifetime is not reloaded on
+  every event. The bounds come from the feature module's own rules:
+  encounters read by STOP, back ``ENCOUNTER_LOOKBACK_DAYS`` from the
+  admission and forward to the discharge instant; medications active
+  at that instant; conditions recorded on or before the discharge date,
+  with no lower bound because the comorbidity flags read resolved
+  history. Nothing is re-expressed: rows outside the window are rows
+  ``build_features`` would have ignored, and the skew test proves the
+  bounded and unbounded reads score identically on rows a second to
+  either side of each bound.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import timedelta
 
 import pandas as pd
 
 from risk_scoring.cohort import build_cohort
-from risk_scoring.features import build_features
-from risk_scoring.state import PatientHistory
+from risk_scoring.features import ENCOUNTER_LOOKBACK_DAYS, build_features
+from risk_scoring.state import (
+    DATE_FORMAT,
+    TIMESTAMP_FORMAT,
+    EncounterEvent,
+    HistoryWindow,
+    PatientHistory,
+    parse_timestamp,
+)
 
 
 class UnknownEncounterError(LookupError):
@@ -75,6 +94,24 @@ class ScoringInput:
 
     cohort: pd.DataFrame
     features: pd.DataFrame
+
+
+def history_window(encounter: EncounterEvent) -> HistoryWindow | None:
+    """The rows scoring this encounter can read, or ``None`` for a stay still open.
+
+    An open stay has no discharge instant to bound against and is not a
+    scoring event, so there is nothing to read for it.
+    """
+    if encounter.stop == "":
+        return None
+    admitted = parse_timestamp(encounter.start)
+    floor = admitted - timedelta(days=ENCOUNTER_LOOKBACK_DAYS)
+    discharged = parse_timestamp(encounter.stop)
+    return HistoryWindow(
+        encounter_stop_from=floor.strftime(TIMESTAMP_FORMAT),
+        discharge=encounter.stop,
+        discharge_date=discharged.strftime(DATE_FORMAT),
+    )
 
 
 def serving_features(history: PatientHistory, encounter_id: str) -> ScoringInput | None:

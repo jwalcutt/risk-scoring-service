@@ -75,6 +75,10 @@ class EventConflictError(RuntimeError):
         )
 
 
+class PatientEventLimitError(RuntimeError):
+    """Storing this event would take its patient past the per-patient event cap."""
+
+
 def _check_exact_format(value: str, fmt: str, label: str) -> None:
     """Require a value that round-trips through the format unchanged."""
     try:
@@ -273,8 +277,30 @@ _CONDITION_SPEC = _TableSpec(
 _RECORD_ATTEMPTS = 3
 """How many times an insert that conflicted may fail to read its conflicting row back."""
 
+_CAPPED_SPECS = (_ENCOUNTER_SPEC, _MEDICATION_SPEC, _CONDITION_SPEC)
 
-def _record(conn: psycopg.Connection[Any], spec: _TableSpec, values: dict[str, str]) -> bool:
+# One round trip over the three patient-leading btrees; demographics are one
+# row per patient by primary key and never count.
+_PATIENT_ROW_COUNT_SQL = " + ".join(
+    f"(SELECT count(*) FROM {spec.table} WHERE {spec.patient_column} = %s)"
+    for spec in _CAPPED_SPECS
+)
+
+
+def _patient_row_count(conn: psycopg.Connection[Any], patient_id: str) -> int:
+    row = conn.execute(f"SELECT {_PATIENT_ROW_COUNT_SQL}", [patient_id] * len(_CAPPED_SPECS))
+    count = row.fetchone()
+    if count is None:
+        raise RuntimeError("row count query returned nothing")
+    return int(count[0])
+
+
+def _record(
+    conn: psycopg.Connection[Any],
+    spec: _TableSpec,
+    values: dict[str, str],
+    max_patient_rows: int | None = None,
+) -> bool:
     """Insert one event row, commit, and report whether it was new.
 
     Identical re-posts are a silent no-op; a re-post whose key exists with
@@ -287,6 +313,13 @@ def _record(conn: psycopg.Connection[Any], spec: _TableSpec, values: dict[str, s
     another writer, not a broken table: the conflicting row was there for
     the insert and gone for the read. The insert and read-back run again,
     a bounded number of times, before that becomes an error.
+
+    With ``max_patient_rows``, a new encounter, medication, or condition
+    that would take its patient's stored total past the cap is rolled back
+    and raises :class:`PatientEventLimitError`. The count runs inside the
+    insert's own transaction, after the insert and before the commit, so it
+    is exact for this connection and costs one indexed round trip. A
+    re-post never reaches it: a row that already exists is not new.
     """
     column_list = ", ".join(spec.db_columns)
     placeholders = ", ".join(["%s"] * len(spec.db_columns))
@@ -300,6 +333,15 @@ def _record(conn: psycopg.Connection[Any], spec: _TableSpec, values: dict[str, s
         for _ in range(_RECORD_ATTEMPTS):
             inserted = conn.execute(insert, [values[name] for name in spec.db_columns])
             if inserted.rowcount == 1:
+                if max_patient_rows is not None and spec in _CAPPED_SPECS:
+                    patient_id = values[spec.patient_column]
+                    total = _patient_row_count(conn, patient_id)
+                    if total > max_patient_rows:
+                        raise PatientEventLimitError(
+                            f"patient {patient_id!r} already holds {total - 1} events, the "
+                            f"configured limit of {max_patient_rows} per patient; this "
+                            f"{spec.table[:-1]} was not stored"
+                        )
                 conn.commit()
                 return True
             stored_row = conn.execute(
@@ -362,14 +404,18 @@ _SPEC_BY_EVENT: dict[type[AnyEvent], _TableSpec] = {
 }
 
 
-def record_event(conn: psycopg.Connection[Any], event: AnyEvent) -> bool:
+def record_event(
+    conn: psycopg.Connection[Any], event: AnyEvent, *, max_patient_rows: int | None = None
+) -> bool:
     """Persist any event, dispatching on its type.
 
     The entry point for callers that hold an event without caring which
     kind it is, such as the ingestion endpoint. Same contract as the
-    per-type functions: True if new, False on an identical re-post.
+    per-type functions: True if new, False on an identical re-post. With
+    ``max_patient_rows``, a new clinical event past the patient's cap
+    raises :class:`PatientEventLimitError` and stores nothing.
     """
-    return _record(conn, _SPEC_BY_EVENT[type(event)], asdict(event))
+    return _record(conn, _SPEC_BY_EVENT[type(event)], asdict(event), max_patient_rows)
 
 
 @dataclass(frozen=True)
@@ -388,13 +434,41 @@ class PatientHistory:
     conditions: pd.DataFrame
 
 
+@dataclass(frozen=True)
+class HistoryWindow:
+    """The rows one discharge's features can read, as bounds on the stored strings.
+
+    Every bound is a verbatim timestamp or date in the export's format, so
+    the comparison is the same lexicographic order the tables are already
+    indexed and sorted by. Which rows a feature can read is the feature
+    module's business; the caller derives these values from it (see
+    ``risk_scoring.serving.history_window``), and this module only applies
+    them.
+    """
+
+    encounter_stop_from: str
+    """Encounters are read when their STOP is at or after this instant."""
+
+    discharge: str
+    """The discharge instant: encounter STOP and medication START at or
+    before it, medication STOP after it or empty."""
+
+    discharge_date: str
+    """The discharge date: condition START on or before it, resolved or not."""
+
+
 def _history_frame(
-    conn: psycopg.Connection[Any], spec: _TableSpec, patient_id: str, order_by: str
+    conn: psycopg.Connection[Any],
+    spec: _TableSpec,
+    patient_id: str,
+    order_by: str,
+    bounds: str = "",
+    params: Sequence[str] = (),
 ) -> pd.DataFrame:
     rows = conn.execute(
         f"SELECT {', '.join(spec.db_columns)} FROM {spec.table}"
-        f" WHERE {spec.patient_column} = %s ORDER BY {order_by}",
-        [patient_id],
+        f" WHERE {spec.patient_column} = %s{bounds} ORDER BY {order_by}",
+        [patient_id, *params],
     ).fetchall()
     return pd.DataFrame(rows, columns=list(spec.frame_columns))
 
@@ -404,13 +478,51 @@ def has_patient(conn: psycopg.Connection[Any], patient_id: str) -> bool:
     return conn.execute("SELECT 1 FROM patients WHERE id = %s", [patient_id]).fetchone() is not None
 
 
-def patient_history(conn: psycopg.Connection[Any], patient_id: str) -> PatientHistory:
-    """Read one patient's full event history; read-only, never commits."""
+def patient_history(
+    conn: psycopg.Connection[Any], patient_id: str, window: HistoryWindow | None = None
+) -> PatientHistory:
+    """Read one patient's event history; read-only, never commits.
+
+    Without a window this is the whole record. With one, each table is
+    narrowed to the rows inside it, which is what scoring one discharge
+    reads: the frames are exactly what the feature module would have
+    read from the full record, minus rows it would have ignored.
+    """
+    if window is None:
+        return PatientHistory(
+            patients=_history_frame(conn, _PATIENT_SPEC, patient_id, "id"),
+            encounters=_history_frame(conn, _ENCOUNTER_SPEC, patient_id, "start, id"),
+            medications=_history_frame(
+                conn, _MEDICATION_SPEC, patient_id, "start, encounter, code"
+            ),
+            conditions=_history_frame(conn, _CONDITION_SPEC, patient_id, "start, encounter, code"),
+        )
     return PatientHistory(
         patients=_history_frame(conn, _PATIENT_SPEC, patient_id, "id"),
-        encounters=_history_frame(conn, _ENCOUNTER_SPEC, patient_id, "start, id"),
-        medications=_history_frame(conn, _MEDICATION_SPEC, patient_id, "start, encounter, code"),
-        conditions=_history_frame(conn, _CONDITION_SPEC, patient_id, "start, encounter, code"),
+        encounters=_history_frame(
+            conn,
+            _ENCOUNTER_SPEC,
+            patient_id,
+            "start, id",
+            " AND stop >= %s AND stop <= %s",
+            [window.encounter_stop_from, window.discharge],
+        ),
+        medications=_history_frame(
+            conn,
+            _MEDICATION_SPEC,
+            patient_id,
+            "start, encounter, code",
+            " AND start <= %s AND (stop = '' OR stop > %s)",
+            [window.discharge, window.discharge],
+        ),
+        conditions=_history_frame(
+            conn,
+            _CONDITION_SPEC,
+            patient_id,
+            "start, encounter, code",
+            " AND start <= %s",
+            [window.discharge_date],
+        ),
     )
 
 

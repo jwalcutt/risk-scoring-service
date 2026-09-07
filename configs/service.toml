@@ -4,3 +4,10 @@ version = 3
 
 [database]
 pool_size = 10
+
+# Encounters, medications, and conditions one patient id may accumulate
+# before the service refuses further events for it. The frozen populations
+# average a few hundred per patient and the largest recorded patient
+# carried 826; docs/service-notes.md records the sizing.
+[limits]
+max_events_per_patient = 20000

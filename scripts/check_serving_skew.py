@@ -55,10 +55,13 @@ def replay(conn: psycopg.Connection[Any], frames: dict[str, pd.DataFrame]) -> pd
         if event.kind == "condition":
             state.record_condition(conn, state.ConditionEvent.from_row(event.row))
             continue
-        state.record_encounter(conn, state.EncounterEvent.from_row(event.row))
-        result = serving.serving_features(
-            state.patient_history(conn, event.row["PATIENT"]), event.row["Id"]
-        )
+        encounter = state.EncounterEvent.from_row(event.row)
+        state.record_encounter(conn, encounter)
+        window = serving.history_window(encounter)
+        if window is None:
+            continue
+        history = state.patient_history(conn, encounter.patient, window)
+        result = serving.serving_features(history, encounter.id)
         if result is not None:
             scored.append(result.features)
 

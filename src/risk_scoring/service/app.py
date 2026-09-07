@@ -23,7 +23,10 @@ Judgment calls this module fixes:
   demographics is a 422 naming the patient, an event contradicting one
   already stored is a 409 naming the key and the differing columns,
   never the stored values, and a body over ``MAX_EVENT_BYTES`` is a 413.
-  None of them is ever a silent drop.
+  An event that would take its patient past the configured event cap is
+  a 409 too: like the conflict, the refusal depends on what is already
+  stored, and re-sending the same request cannot succeed. None of them
+  is ever a silent drop.
 - ``POST /events`` requires the bearer token from
   ``RISK_SCORING_API_TOKEN``. The check is a route dependency, so it
   runs before the body is validated and an unauthenticated caller
@@ -71,7 +74,7 @@ from risk_scoring.service.config import ServiceConfig
 from risk_scoring.service.events import Event, to_state_event
 from risk_scoring.service.ingest import IngestResult, ingest_event
 from risk_scoring.serving import UnknownPatientError
-from risk_scoring.state import EventConflictError, MalformedEventError
+from risk_scoring.state import EventConflictError, MalformedEventError, PatientEventLimitError
 from risk_scoring.tracking import configure_tracking, tracking_uri
 
 POOL_STARTUP_TIMEOUT_SECONDS = 10.0
@@ -257,6 +260,11 @@ def create_app(config: ServiceConfig, repo_root: Path, dsn: str | None = None) -
                 "columns": list(exc.columns),
             },
         )
+
+    @app.exception_handler(PatientEventLimitError)
+    async def patient_event_limit(request: Request, exc: Exception) -> JSONResponse:
+        """A patient id at its event cap takes nothing new; the refusal names the cap."""
+        return JSONResponse(status_code=409, content={"detail": str(exc)})
 
     @app.exception_handler(PoolTimeout)
     async def pool_exhausted(request: Request, exc: Exception) -> JSONResponse:
