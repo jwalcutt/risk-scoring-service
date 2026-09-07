@@ -26,7 +26,7 @@ Generation requires Java 17 or later on the PATH:
 python -m risk_scoring.datagen generate all
 ```
 
-`python -m risk_scoring.datagen verify` checks local data against the committed manifests, and `sanity` prints summary statistics for a population.
+`python -m risk_scoring.datagen verify` checks local data against the committed manifests, and `sanity` prints summary statistics for one population, or for every population with `sanity all`.
 
 ## Model registry
 

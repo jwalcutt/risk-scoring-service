@@ -5,7 +5,7 @@ Usage (from the repo root):
     python -m risk_scoring.datagen generate [population|all] [--force]
     python -m risk_scoring.datagen manifest [population|all]
     python -m risk_scoring.datagen verify [population|all]
-    python -m risk_scoring.datagen sanity [population]
+    python -m risk_scoring.datagen sanity [population|all]
 """
 
 from __future__ import annotations
@@ -73,7 +73,7 @@ def main(argv: list[str] | None = None) -> None:
         if name == "generate":
             p.add_argument("--force", action="store_true")
 
-    p = sub.add_parser("sanity", help="print rough sanity stats for a population")
+    p = sub.add_parser("sanity", help="print rough sanity stats for a population, or all")
     p.add_argument("population", nargs="?", default="baseline")
 
     args = parser.parse_args(argv)
@@ -111,9 +111,11 @@ def main(argv: list[str] | None = None) -> None:
             sys.exit(1)
     elif args.command == "sanity":
         as_of = datetime.strptime(config.generation.reference_date, "%Y%m%d").date()
-        stats = compute_sanity_stats(_csv_dir(repo_root, args.population), as_of=as_of)
-        for key, value in dataclasses.asdict(stats).items():
-            print(f"{key}: {value}")
+        for population in _populations(config, args.population):
+            stats = compute_sanity_stats(_csv_dir(repo_root, population), as_of=as_of)
+            print(f"{population}:")
+            for key, value in dataclasses.asdict(stats).items():
+                print(f"  {key}: {value}")
 
 
 if __name__ == "__main__":
