@@ -19,10 +19,14 @@ Judgment calls this module fixes:
   ``deathdate``) accept ``""`` or an exactly formatted value. Required
   timestamps and dates must round-trip through their format unchanged,
   so non-zero-padded near-misses are rejected.
-- A non-empty ``stop`` must not precede its ``start``. Equality is
-  allowed, since the export records zero-length encounters. A reversed
-  interval would otherwise reach the feature module as a negative length
-  of stay and be scored and logged as if it were valid.
+- A non-empty encounter or condition ``stop`` must not precede its
+  ``start``. Equality is allowed, since the export records zero-length
+  encounters. A reversed encounter would otherwise reach the feature
+  module as a negative length of stay and be scored and logged as if it
+  were valid. Medications are exempt: the generator emits a small share
+  of prescriptions with ``STOP`` one to six days before ``START`` (714 of
+  553,590 in the frozen baseline), the feature module reads such a row as
+  never active, and refusing it would stop a replay on generator output.
 """
 
 from __future__ import annotations
@@ -175,7 +179,6 @@ class MedicationEvent:
         _check_non_empty(self.code, "medication CODE")
         _check_exact_format(self.start, TIMESTAMP_FORMAT, "medication START")
         _check_optional_format(self.stop, TIMESTAMP_FORMAT, "medication STOP")
-        _check_interval_order(self.start, self.stop, TIMESTAMP_FORMAT, "medication")
 
     @classmethod
     def from_row(cls, row: Mapping[str, str]) -> MedicationEvent:

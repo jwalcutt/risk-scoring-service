@@ -135,11 +135,12 @@ def test_medication_rejects_malformed_stop() -> None:
         state.MedicationEvent.from_row(make_medication_row(STOP="2024-01-08"))
 
 
-def test_medication_rejects_stop_before_start() -> None:
-    with pytest.raises(state.MalformedEventError):
-        state.MedicationEvent.from_row(
-            make_medication_row(START="2024-01-08T08:00:00Z", STOP="2024-01-08T07:59:59Z")
-        )
+def test_medication_accepts_stop_before_start() -> None:
+    """The frozen baseline holds 714 such prescriptions, so a replay must ingest them."""
+    event = state.MedicationEvent.from_row(
+        make_medication_row(START="2023-01-04T16:01:20Z", STOP="2022-12-30T16:01:20Z")
+    )
+    assert event.stop < event.start
 
 
 def test_medication_allows_stop_equal_to_start() -> None:
