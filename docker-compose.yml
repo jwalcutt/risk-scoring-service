@@ -8,12 +8,21 @@ services:
   postgres:
     # Digest recorded in docs/service-notes.md; bump tag and digest together.
     image: postgres:17.6-alpine
+    # The risk/risk defaults exist so a fresh clone comes up with one command.
+    # They are acceptable only because the port below is published on
+    # loopback: nothing off the machine can reach the database. For anything
+    # else, set POSTGRES_PASSWORD in a gitignored .env file beside this file;
+    # Compose reads it, and host-side commands need the matching
+    # RISK_SCORING_DATABASE_URL in the same place.
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-risk}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-risk}
       POSTGRES_DB: ${POSTGRES_DB:-risk_scoring}
     ports:
-      - "${POSTGRES_PORT:-5433}:5432"
+      # Bound to 127.0.0.1, not every interface. The migrate and app services
+      # reach Postgres over the compose network, so only host-side commands
+      # use this port, and they all connect to localhost.
+      - "127.0.0.1:${POSTGRES_PORT:-5433}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
