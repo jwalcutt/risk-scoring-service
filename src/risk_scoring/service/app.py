@@ -20,9 +20,15 @@ Judgment calls this module fixes:
 - Every way an event can be refused is a 4xx: a bad shape is FastAPI's
   422, a bad field format or a reversed interval is the same 422 raised
   from the state layer, a discharge arriving before its patient's
-  demographics is a 422 naming the patient, and an event contradicting
-  one already stored is a 409 naming the key and the differing columns,
-  never the stored values. None of them is ever a silent drop.
+  demographics is a 422 naming the patient, an event contradicting one
+  already stored is a 409 naming the key and the differing columns,
+  never the stored values, and a body over ``MAX_EVENT_BYTES`` is a 413.
+  None of them is ever a silent drop.
+- The size cap is enforced in ASGI middleware rather than in the handler,
+  because FastAPI buffers the whole body to build the ``Event`` parameter
+  before the handler runs. The middleware refuses on the declared
+  Content-Length without reading a byte, and counts a chunked body as it
+  streams in so the refusal lands at the chunk that crosses the limit.
 - The pool's size comes from the config and is passed explicitly, since
   ``psycopg_pool`` otherwise caps it at ``min_size``. A request that waits
   out the pool gets a 503 with a JSON body rather than an unhandled 500.
@@ -48,6 +54,9 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from mlflow.exceptions import MlflowException
 from psycopg_pool import ConnectionPool, PoolTimeout
+from starlette.datastructures import Headers
+from starlette.exceptions import HTTPException
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from risk_scoring.cohort import COHORT_VERSION
 from risk_scoring.db import database_url
@@ -62,6 +71,62 @@ from risk_scoring.tracking import configure_tracking, tracking_uri
 
 POOL_STARTUP_TIMEOUT_SECONDS = 10.0
 ENV_GIT_SHA = "RISK_SCORING_GIT_SHA"
+
+# An event document is a few hundred bytes, so 1 MiB is thousands of times
+# the largest legitimate body and still small enough that buffering it, and
+# the parsed copies json and pydantic make of it, costs nothing. The cap
+# bounds one request's body: a declared Content-Length over it is refused
+# unread, and a chunked body is refused at the chunk that crosses it, so at
+# most one chunk past the limit is ever held. It does not bound how many
+# requests are in flight at once, and it does not replace a proxy limit if
+# the service is ever bound to anything but loopback.
+MAX_EVENT_BYTES = 1 * 1024 * 1024
+EVENTS_PATH = "/events"
+
+
+def _too_large_detail(limit: int) -> str:
+    return f"event body exceeds {limit} bytes"
+
+
+class EventBodyLimit:
+    """ASGI middleware refusing a ``POST /events`` body over the limit with 413.
+
+    Everything else passes through untouched. The refusal body is the same
+    ``{"detail": ...}`` shape as every other 4xx the service returns.
+    """
+
+    def __init__(self, app: ASGIApp, limit: int = MAX_EVENT_BYTES) -> None:
+        self.app = app
+        self.limit = limit
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or scope["method"] != "POST" or scope["path"] != EVENTS_PATH:
+            await self.app(scope, receive, send)
+            return
+
+        declared = Headers(scope=scope).get("content-length", "")
+        if declared.isdigit() and int(declared) > self.limit:
+            response = JSONResponse(
+                status_code=413, content={"detail": _too_large_detail(self.limit)}
+            )
+            await response(scope, receive, send)
+            return
+
+        received = 0
+
+        async def bounded_receive() -> Message:
+            # FastAPI reads the body through this before validating it. It
+            # re-raises an HTTPException from the read as-is, and the app's
+            # exception middleware turns it into the 413 response.
+            nonlocal received
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > self.limit:
+                    raise HTTPException(status_code=413, detail=_too_large_detail(self.limit))
+            return message
+
+        await self.app(scope, bounded_receive, send)
 
 
 def resolve_git_sha(repo_root: Path) -> str | None:
@@ -141,6 +206,7 @@ def create_app(config: ServiceConfig, repo_root: Path, dsn: str | None = None) -
             pool.close()
 
     app = FastAPI(title="risk-scoring-service", lifespan=lifespan)
+    app.add_middleware(EventBodyLimit)
 
     @app.exception_handler(MalformedEventError)
     async def malformed_event(request: Request, exc: Exception) -> JSONResponse:
@@ -198,7 +264,7 @@ def create_app(config: ServiceConfig, repo_root: Path, dsn: str | None = None) -
             "git_sha": git_sha,
         }
 
-    @app.post("/events", status_code=202)
+    @app.post(EVENTS_PATH, status_code=202)
     async def ingest(event: Event, request: Request) -> dict[str, Any]:
         raw_event = json.loads(await request.body())
         input_hash = payload_hash(raw_event)
