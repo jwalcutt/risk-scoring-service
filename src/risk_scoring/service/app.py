@@ -23,6 +23,12 @@ Judgment calls this module fixes:
   the patient, and an event contradicting one already stored is a 409
   naming the key and the differing columns, never the stored values.
   None of them is ever a silent drop.
+- The pool's size comes from the config and is passed explicitly, since
+  ``psycopg_pool`` otherwise caps it at ``min_size``. A request that waits
+  out the pool gets a 503 with a JSON body rather than an unhandled 500.
+  Posting the event again is always the right response: an event that
+  was stored is a no-op on re-post, and a discharge whose score was not
+  written is scored then.
 """
 
 from __future__ import annotations
@@ -40,7 +46,7 @@ from fastapi import FastAPI, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from mlflow.exceptions import MlflowException
-from psycopg_pool import ConnectionPool
+from psycopg_pool import ConnectionPool, PoolTimeout
 
 from risk_scoring.cohort import COHORT_VERSION
 from risk_scoring.db import database_url
@@ -96,8 +102,10 @@ def _load_model(config: ServiceConfig, repo_root: Path) -> Any:
         ) from exc
 
 
-def _open_pool(dsn: str) -> ConnectionPool[Any]:
-    pool: ConnectionPool[Any] = ConnectionPool(dsn, min_size=1, open=False)
+def _open_pool(dsn: str, max_size: int) -> ConnectionPool[Any]:
+    # max_size is explicit because psycopg_pool sets it equal to min_size
+    # when omitted, which would cap the service at one connection.
+    pool: ConnectionPool[Any] = ConnectionPool(dsn, min_size=1, max_size=max_size, open=False)
     try:
         pool.open(wait=True, timeout=POOL_STARTUP_TIMEOUT_SECONDS)
     except Exception as exc:
@@ -115,7 +123,7 @@ def create_app(config: ServiceConfig, repo_root: Path, dsn: str | None = None) -
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         model = _load_model(config, repo_root)
-        pool = _open_pool(dsn)
+        pool = _open_pool(dsn, config.pool_size)
         app.state.model = model
         app.state.pool = pool
         app.state.config = config
@@ -159,6 +167,14 @@ def create_app(config: ServiceConfig, repo_root: Path, dsn: str | None = None) -
             },
         )
 
+    @app.exception_handler(PoolTimeout)
+    async def pool_exhausted(request: Request, exc: Exception) -> JSONResponse:
+        """Every pooled connection stayed busy for the whole wait: retry later."""
+        return JSONResponse(
+            status_code=503,
+            content={"detail": f"no database connection became free in time ({exc})"},
+        )
+
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
@@ -198,7 +214,6 @@ def create_app(config: ServiceConfig, repo_root: Path, dsn: str | None = None) -
 def _store_and_score(
     app_state: Any, config: ServiceConfig, event: Any, input_hash: str
 ) -> IngestResult:
-    """Run the blocking half of ingestion on a pooled connection."""
+    """Run the blocking half of ingestion, borrowing pooled connections as needed."""
     pool: ConnectionPool[Any] = app_state.pool
-    with pool.connection() as conn:
-        return ingest_event(conn, app_state.model, config, event, input_hash)
+    return ingest_event(pool.connection, app_state.model, config, event, input_hash)

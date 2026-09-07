@@ -77,3 +77,33 @@ def test_committed_config_parses_and_matches_registry_name() -> None:
     config = load_config(_REPO_ROOT / "configs" / "service.toml")
     assert config.model_name == MODEL_NAME
     assert config.model_version >= 1
+
+
+# --- the connection pool size ---
+
+
+def test_pool_size_defaults_to_ten_when_the_database_table_is_absent(tmp_path: Path) -> None:
+    path = _write(tmp_path, '[model]\nname = "readmission-risk"\nversion = 3\n')
+    assert load_config(path).pool_size == 10
+
+
+def test_pool_size_loads_from_the_database_table(tmp_path: Path) -> None:
+    path = _write(
+        tmp_path, '[model]\nname = "readmission-risk"\nversion = 3\n\n[database]\npool_size = 4\n'
+    )
+    assert load_config(path).pool_size == 4
+
+
+@pytest.mark.parametrize("pool_size", ["0", "-2", '"10"', "true"])
+def test_pool_size_must_be_a_positive_integer(tmp_path: Path, pool_size: str) -> None:
+    path = _write(
+        tmp_path,
+        f'[model]\nname = "readmission-risk"\nversion = 3\n\n[database]\npool_size = {pool_size}\n',
+    )
+    with pytest.raises(ValueError, match="pool_size"):
+        load_config(path)
+
+
+def test_committed_config_pins_the_pool_size() -> None:
+    config = load_config(_REPO_ROOT / "configs" / "service.toml")
+    assert config.pool_size == 10

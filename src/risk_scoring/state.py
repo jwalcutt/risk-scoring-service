@@ -252,6 +252,10 @@ _CONDITION_SPEC = _TableSpec(
 )
 
 
+_RECORD_ATTEMPTS = 3
+"""How many times an insert that conflicted may fail to read its conflicting row back."""
+
+
 def _record(conn: psycopg.Connection[Any], spec: _TableSpec, values: dict[str, str]) -> bool:
     """Insert one event row, commit, and report whether it was new.
 
@@ -260,25 +264,36 @@ def _record(conn: psycopg.Connection[Any], spec: _TableSpec, values: dict[str, s
     Each call commits its own row: an acknowledged event must be a persisted
     event for crash retries and replay resumes to hold, so callers must not
     wrap record calls in a larger transaction they intend to roll back.
+
+    An insert that conflicted and then read back no row is the trace of
+    another writer, not a broken table: the conflicting row was there for
+    the insert and gone for the read. The insert and read-back run again,
+    a bounded number of times, before that becomes an error.
     """
     column_list = ", ".join(spec.db_columns)
     placeholders = ", ".join(["%s"] * len(spec.db_columns))
     key_filter = " AND ".join(f"{name} = %s" for name in spec.key_columns)
+    insert = (
+        f"INSERT INTO {spec.table} ({column_list}) VALUES ({placeholders})"
+        f" ON CONFLICT ({', '.join(spec.key_columns)}) DO NOTHING"
+    )
+    read_back = f"SELECT {column_list} FROM {spec.table} WHERE {key_filter}"
     try:
-        cursor = conn.execute(
-            f"INSERT INTO {spec.table} ({column_list}) VALUES ({placeholders})"
-            f" ON CONFLICT ({', '.join(spec.key_columns)}) DO NOTHING",
-            [values[name] for name in spec.db_columns],
-        )
-        if cursor.rowcount == 1:
-            conn.commit()
-            return True
-        stored_row = conn.execute(
-            f"SELECT {column_list} FROM {spec.table} WHERE {key_filter}",
-            [values[name] for name in spec.key_columns],
-        ).fetchone()
-        if stored_row is None:
-            raise RuntimeError(f"{spec.table} row vanished between insert and read-back")
+        for _ in range(_RECORD_ATTEMPTS):
+            inserted = conn.execute(insert, [values[name] for name in spec.db_columns])
+            if inserted.rowcount == 1:
+                conn.commit()
+                return True
+            stored_row = conn.execute(
+                read_back, [values[name] for name in spec.key_columns]
+            ).fetchone()
+            if stored_row is not None:
+                break
+        else:
+            raise RuntimeError(
+                f"{spec.table} row conflicted on insert but was absent on read-back "
+                f"{_RECORD_ATTEMPTS} times in a row"
+            )
         stored = dict(zip(spec.db_columns, stored_row, strict=True))
         if stored == values:
             conn.commit()

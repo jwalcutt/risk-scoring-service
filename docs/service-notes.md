@@ -104,7 +104,7 @@ Events arrive over one endpoint, in timestamp order, one at a time, wrapped in a
 
 The split between the two layers is deliberate and narrow. The request models own shape: which fields exist, that no unknown field sneaks in, and which event type an envelope names. `state` owns every value rule: required-and-non-empty, the exact timestamp and date formats, and which fields may be empty. Both layers were built in parallel and independently arrived at the same four column sets and the same format checks, which is exactly the kind of duplication that drifts, so the format rules now live once and a test asserts each payload's field set equals the matching column tuple in `state`.
 
-Every refusal is a 4xx, and none is a silent drop:
+Every refusal of an event is a 4xx, and none is a silent drop. The one other non-2xx answer is about the service's capacity rather than the event:
 
 | Refusal | Status | Cause |
 | --- | --- | --- |
@@ -112,6 +112,7 @@ Every refusal is a 4xx, and none is a silent drop:
 | A value that fails its exact format, or an empty identity field | 422 | `MalformedEventError` from the state layer, raised at conversion |
 | An inpatient discharge whose patient has no recorded demographics | 422 | `UnknownPatientError`, naming the patient |
 | An event contradicting one already stored under the same key | 409 | `EventConflictError`, naming the key and the differing column names; the values are logged server-side only |
+| Every pooled connection stayed busy for the whole wait | 503 | `PoolTimeout` from the pool; post the event again, which is a no-op for whatever was stored |
 
 The unknown-patient case is an ordering violation rather than a bad payload: the cohort rules need a birthdate, so demographics must precede a patient's first discharge. Reporting it rather than skipping the score is the point, since a silently unscored discharge would look identical to a cohort exclusion. The check runs before the state write, so a refused discharge is not stored. An earlier version stored it first and refused afterwards, which answered 4xx for an event the service had kept: a caller who believed the refusal and never re-posted was left with a discharge that only a re-post could score, since posting the encounter is the only thing that triggers scoring. Re-posting the discharge once the demographics arrive stores and scores it normally, and a refused event of any kind now leaves nothing in state.
 
@@ -130,7 +131,7 @@ Accepted events answer 202 rather than 200, which stays honest for the events th
 
 Nothing in that sequence re-expresses a cohort or feature rule, which is what keeps "one cohort module and one feature module, shared verbatim" structural.
 
-The endpoint handler is async only long enough to read the raw body for the hash. Everything after that (database, pandas, the model) runs in the threadpool, so one slow scoring call cannot stall the event loop. Connections come from a `psycopg_pool` pool opened at startup rather than one connection per request, since a replay posts events continuously.
+The endpoint handler is async only long enough to read the raw body for the hash. Everything after that (database, pandas, the model) runs in the threadpool, so one slow scoring call cannot stall the event loop. Connections come from a `psycopg_pool` pool opened at startup rather than one connection per request, since a replay posts events continuously. The pool is capped at `database.pool_size` connections from `configs/service.toml`, and a request borrows one for steps 1 to 4's reads and writes, lets it go for the feature build and the model call, and borrows one again for step 5's log write. The section on the pool size below records why.
 
 ## Predictions log
 
@@ -319,3 +320,15 @@ The restart check failed the first time it ran, and the reason is worth keeping.
 That connection was hoisted to run scope when the posting code moved out of the check script and into `risk_scoring.service_client`, and the check had not been run against the containers since. Nothing in CI could catch it: the restart test there drives the app in process through a test client, which has no socket to lose. The equivalent hazard for a caller that never restarts anything is an idle service closing a kept-alive connection on its own timeout.
 
 `ServiceClient` now reopens the connection once and repeats the request, but only when the connection had already carried a request, since one that fails on its first use was never established rather than dropped. Repeating a post is safe because the service treats a re-posted event as a no-op, and the retry is bounded at one so a service that is genuinely gone fails rather than spins. Three tests in `tests/test_service_client.py` cover the reopen, the bound, and the refusal to retry a fresh connection.
+
+## Pool size and the scoring hold
+
+Recorded 2026-09-06. The pool was opened with `min_size=1` and no `max_size`, and `psycopg_pool` sets a missing `max_size` equal to `min_size`, so the service held exactly one Postgres connection. Every request borrowed it for the whole ingestion path, the state write, the log check, the history read, the pandas feature build, and the LightGBM call, while up to 40 threadpool workers queued behind it. A burst of posts turned into `PoolTimeout` after the pool's 30 second wait, and nothing caught that exception, so the client saw a 500. Four changes, each with a test.
+
+The pool size is explicit. `configs/service.toml` carries a `[database]` table with `pool_size`, defaulting to 10 when the table is absent, and the app passes it as `max_size`. Ten is well inside the Compose Postgres's default `max_connections` of 100 and leaves room for the replay harness, the migration runner, and the throwaway databases the test suite opens against the same server. A value that is not a positive integer is refused at load, the same way a bad model pin is.
+
+Scoring no longer holds a connection. `ingest_event` takes a way to borrow a connection rather than a connection, borrows one for the state write, the log check, and the history read, lets it go, builds features and scores, then borrows one again for the log write. The test that pins this runs a pool of one connection and swaps in a model whose `predict` needs that connection: the post can only come back 202 if the request released it. Dropping the connection between the halves does open a second wait, and a request can time out there with its event already stored and its score not. That is the crash window the log's uniqueness constraint already covers, and the resume tests in `tests/test_restart_postgres.py` pass unchanged: whoever posts the event next scores it.
+
+A wait that runs out is a 503 with a JSON body, registered beside the 4xx handlers. The client should post the event again; a re-post is a no-op for whatever was stored and scores whatever was not.
+
+The size-1 pool had also been hiding an untested branch in `state._record`. After an `INSERT ... ON CONFLICT DO NOTHING` reports no row written, the code reads the conflicting row back to compare it with the posted values, and a read-back that found nothing raised a bare `RuntimeError`. With one connection that could not happen; with several writers it is the trace of a row that was there for the insert and gone for the read. The insert and read-back now run again, up to three times, before that becomes an error, and the error names the table and the count. Two tests in `tests/test_state_postgres.py` drive it through a connection subclass that tampers with the read-back only: one deletes the row through a second connection just before the read-back and expects the retry's insert to land, the other makes every read-back come up empty and expects the bounded failure to leave the connection usable. A third, in `tests/test_service_ingest_postgres.py`, posts the same discharge from eight threads at once through the default pool and requires eight 202s, one encounter row, one prediction row, and exactly one response claiming the score.
