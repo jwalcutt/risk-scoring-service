@@ -5,19 +5,28 @@ of that row's discharge timestamp, from raw Synthea CSV frames. The same
 module serves training and scoring, so no feature may read anything
 recorded after the scoring discharge. ``FEATURE_VERSION`` is logged with
 every prediction so any scored row can be traced to the exact feature
-definitions that produced it.
+definitions that produced it. Its minor number moves when a definition
+changes and a value on existing data can differ, which also means a
+model trained under the previous number no longer matches serving; its
+patch number moves when only parsing or validation changes and no value
+does.
 
 Judgment calls this module fixes:
 
 - Prior-event windows span 180 days ending at the discharge instant,
-  inclusive at the far edge. Prior encounters are dated by their STOP,
-  so a stay still open at scoring time is invisible; the scoring
-  encounter never counts itself.
+  inclusive at the far edge and strict at the near edge: an encounter
+  counts as prior only when its STOP is before the scoring discharge's
+  STOP. Prior encounters are dated by their STOP, so a stay still open
+  at scoring time is invisible, and the scoring encounter never counts
+  itself. Two discharges sharing a STOP do not count each other. The
+  service scores each event as it arrives, so the first of two
+  same-instant discharges cannot see the second, and the batch rule
+  matches what the stream can know rather than the other way round.
 - Days since previous discharge runs from the most recent prior
-  inpatient STOP (at or before the scoring discharge) to the current
-  admission START, floored at 0 for overlapping stays and capped at
-  ``DAYS_SINCE_PREV_DISCHARGE_CAP``. A patient with no prior discharge
-  gets the cap value as sentinel.
+  inpatient STOP (strictly before the scoring discharge's STOP) to the
+  current admission START, floored at 0 for overlapping stays and
+  capped at ``DAYS_SINCE_PREV_DISCHARGE_CAP``. A patient with no prior
+  discharge gets the cap value as sentinel.
 - ED visits are ``ENCOUNTERCLASS == "emergency"`` only; urgent care is
   a distinct class and is not counted.
 - A medication is active at discharge when its START is at or before
@@ -62,7 +71,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-FEATURE_VERSION = "1.0.0"
+FEATURE_VERSION = "1.1.0"
 
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
@@ -185,9 +194,7 @@ def build_features(
         }
     )
     joined = anchor.merge(enc, on="patient_id", how="inner")
-    known = (joined["prior_stop"] <= joined["score_stop"]) & (
-        joined["Id"] != joined["encounter_id"]
-    )
+    known = (joined["prior_stop"] < joined["score_stop"]) & (joined["Id"] != joined["encounter_id"])
     in_window = known & (
         joined["prior_stop"]
         >= joined["score_stop"] - pd.Timedelta(np.timedelta64(WINDOW_DAYS, "D"))

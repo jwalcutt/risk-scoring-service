@@ -8,7 +8,9 @@ these tests pin:
 - Prior-event windows span 180 days ending at discharge, inclusive at
   the far edge: an event exactly 180 days old still counts. Prior
   encounters are dated by their STOP, so a stay still open at scoring
-  time is invisible.
+  time is invisible. The near edge is strict: an encounter ending at
+  the scoring instant is not prior, so two discharges sharing a STOP do
+  not count each other, and neither measures its gap from the other.
 - Days since previous discharge runs from the previous inpatient STOP to
   the current admission START, floored at 0 for overlapping stays and
   capped at 365; a patient with no prior discharge gets the cap value as
@@ -199,6 +201,31 @@ def test_scoring_encounter_does_not_count_itself() -> None:
     assert row["prior_inpatient_180d"] == 0
 
 
+def test_two_discharges_sharing_a_stop_see_only_the_earlier_stay() -> None:
+    """Worked example: a stay ending at the scoring instant is not prior.
+
+    p1 leaves an earlier stay on 05-20, then two stays end together on
+    06-05: one admitted 05-28, one admitted 06-01. Each sees one prior
+    (the 05-20 discharge) and measures its gap from it: 8 days for the
+    05-28 admission, 12 for the 06-01 admission. Counting the twin would
+    give 2 priors and floor both gaps at 0.
+    """
+    twin_a = prior_stay(SCORE_STOP, start="2024-05-28T08:00:00Z", encounter_id="e-twin-a")
+    twin_b = prior_stay(SCORE_STOP, start=SCORE_START, encounter_id="e-twin-b")
+    earlier = prior_stay("2024-05-20T08:00:00Z", encounter_id="e-earlier")
+    cohort_rows = [
+        make_cohort_row(encounter_id="e-twin-a", start="2024-05-28T08:00:00Z", stop=SCORE_STOP),
+        make_cohort_row(encounter_id="e-twin-b", start=SCORE_START, stop=SCORE_STOP),
+    ]
+    result = features_for(cohort_rows, encounters=[twin_a, twin_b, earlier]).set_index(
+        "encounter_id"
+    )
+    assert result.loc["e-twin-a", "prior_inpatient_180d"] == 1
+    assert result.loc["e-twin-b", "prior_inpatient_180d"] == 1
+    assert result.loc["e-twin-a", "days_since_prev_discharge"] == 8.0
+    assert result.loc["e-twin-b", "days_since_prev_discharge"] == 12.0
+
+
 def test_stay_still_open_at_discharge_is_invisible() -> None:
     overlapping = prior_stay("2024-06-20T08:00:00Z", start="2024-05-25T08:00:00Z")
     row = single(encounters=[overlapping])
@@ -279,6 +306,11 @@ def test_ed_visit_exactly_180_days_before_discharge_counts() -> None:
 
 def test_urgentcare_is_not_an_ed_visit() -> None:
     row = single(encounters=[ed_visit("2024-05-15T12:00:00Z", encounter_class="urgentcare")])
+    assert row["prior_ed_180d"] == 0
+
+
+def test_ed_visit_ending_at_the_discharge_instant_does_not_count() -> None:
+    row = single(encounters=[ed_visit(SCORE_STOP)])
     assert row["prior_ed_180d"] == 0
 
 

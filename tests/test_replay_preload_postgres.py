@@ -29,10 +29,10 @@ BEFORE = "2024-06-01T00:00:00Z"
 
 # Cohort discharges in the skew population dated before BEFORE, counted by
 # hand from the factory: e-edge-in, e-gap-ancient, e-gap-index, the two
-# overlapping stays, both readmission stays, and e-fresh. The minor and the
-# in-hospital death are excluded by the cohort rules; e-edge-index and
-# e-full-index are discharged after BEFORE.
-DISCHARGES_BEFORE = 8
+# overlapping stays, both readmission stays, e-fresh, and the three p-twin
+# stays. The minor and the in-hospital death are excluded by the cohort
+# rules; e-edge-index and e-full-index are discharged after BEFORE.
+DISCHARGES_BEFORE = 11
 
 _EVENT_TYPES: dict[str, type[state.AnyEvent]] = {
     "patient": state.PatientEvent,
