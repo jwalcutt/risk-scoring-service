@@ -7,6 +7,20 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
+class InsecureJarUrlError(ValueError):
+    """Raised when the Synthea jar URL would be fetched over anything but HTTPS."""
+
+
+def require_https_url(url: str) -> None:
+    """Refuse a jar URL unless it starts with ``https://``.
+
+    The jar is executed with ``java -jar``, so a plain-HTTP, file, or FTP
+    URL would let whatever answers the fetch run on the host.
+    """
+    if not url.startswith("https://"):
+        raise InsecureJarUrlError(f"jar_url must start with https://, got {url!r}")
+
+
 @dataclass(frozen=True)
 class SyntheaConfig:
     version: str
@@ -43,6 +57,7 @@ def load_config(path: Path) -> GenerationConfig:
     with path.open("rb") as fh:
         raw = tomllib.load(fh)
 
+    require_https_url(raw["synthea"]["jar_url"])
     synthea = SyntheaConfig(
         version=raw["synthea"]["version"],
         jar_url=raw["synthea"]["jar_url"],

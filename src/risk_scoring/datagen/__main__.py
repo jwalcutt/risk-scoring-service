@@ -18,8 +18,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from risk_scoring.datagen.config import GenerationConfig, load_config, output_dir
-from risk_scoring.datagen.download import ensure_jar
+from risk_scoring.datagen.config import (
+    GenerationConfig,
+    InsecureJarUrlError,
+    load_config,
+    output_dir,
+)
+from risk_scoring.datagen.download import ChecksumMismatchError, UnpinnedJarError, ensure_jar
 from risk_scoring.datagen.generate import run_generation
 from risk_scoring.datagen.manifest import build_manifest, verify_manifest
 from risk_scoring.datagen.sanity import compute_sanity_stats
@@ -78,12 +83,14 @@ def main(argv: list[str] | None = None) -> None:
 
     args = parser.parse_args(argv)
     repo_root = Path.cwd()
-    config = load_config(repo_root / CONFIG_PATH)
+    try:
+        config = load_config(repo_root / CONFIG_PATH)
+        if args.command in ("download", "generate"):
+            ensure_jar(config, repo_root)
+    except (InsecureJarUrlError, UnpinnedJarError, ChecksumMismatchError) as exc:
+        sys.exit(str(exc))
 
-    if args.command == "download":
-        ensure_jar(config, repo_root)
-    elif args.command == "generate":
-        ensure_jar(config, repo_root)
+    if args.command == "generate":
         for population in _populations(config, args.population):
             print(f"generating '{population}'...")
             run_generation(config, population, repo_root, force=args.force)
