@@ -392,6 +392,21 @@ def test_the_connection_is_released_while_the_model_scores(
     assert body["scored"] is True
 
 
+def test_discharge_ending_before_it_starts_is_refused_and_writes_nothing(
+    client: TestClient, conn: psycopg.Connection[Any]
+) -> None:
+    """A reversed interval would score a negative length of stay; refuse it instead."""
+    _post(client, _patient())
+    reversed_stay = _discharge(START="2024-05-04T17:30:00Z", STOP="2024-05-01T08:00:00Z")
+
+    bad = client.post("/events", json=reversed_stay)
+
+    assert bad.status_code == 422
+    assert "STOP" in bad.text
+    assert _prediction_count(conn) == 0
+    assert len(state.patient_history(conn, "patient-1").encounters) == 0
+
+
 def test_divergent_repost_is_rejected_and_leaves_the_first_score_standing(
     client: TestClient, conn: psycopg.Connection[Any]
 ) -> None:

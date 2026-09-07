@@ -18,11 +18,11 @@ Judgment calls this module fixes:
   after that (database, pandas, the model) runs in the threadpool, so
   one slow scoring call cannot stall the event loop.
 - Every way an event can be refused is a 4xx: a bad shape is FastAPI's
-  422, a bad field format is the same 422 raised from the state layer, a
-  discharge arriving before its patient's demographics is a 422 naming
-  the patient, and an event contradicting one already stored is a 409
-  naming the key and the differing columns, never the stored values.
-  None of them is ever a silent drop.
+  422, a bad field format or a reversed interval is the same 422 raised
+  from the state layer, a discharge arriving before its patient's
+  demographics is a 422 naming the patient, and an event contradicting
+  one already stored is a 409 naming the key and the differing columns,
+  never the stored values. None of them is ever a silent drop.
 - The pool's size comes from the config and is passed explicitly, since
   ``psycopg_pool`` otherwise caps it at ``min_size``. A request that waits
   out the pool gets a 503 with a JSON body rather than an unhandled 500.
