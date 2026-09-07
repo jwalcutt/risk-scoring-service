@@ -224,7 +224,9 @@ def test_connection_usable_after_conflict(db_conn: psycopg.Connection[Any]) -> N
 def test_history_ordered_by_start_regardless_of_arrival_order(
     db_conn: psycopg.Connection[Any],
 ) -> None:
-    late = make_encounter_row(Id="encounter-late", START="2024-06-01T08:00:00Z")
+    late = make_encounter_row(
+        Id="encounter-late", START="2024-06-01T08:00:00Z", STOP="2024-06-03T08:00:00Z"
+    )
     early = make_encounter_row(Id="encounter-early", START="2023-06-01T08:00:00Z")
     _record(db_conn, "encounter", late)
     _record(db_conn, "encounter", early)
@@ -316,7 +318,9 @@ def test_record_batch_reads_back_identical_to_per_row_recording(
 ) -> None:
     patient_row = make_patient_row()
     early = make_encounter_row(Id="encounter-early", START="2023-06-01T08:00:00Z")
-    late = make_encounter_row(Id="encounter-late", START="2024-06-01T08:00:00Z")
+    late = make_encounter_row(
+        Id="encounter-late", START="2024-06-01T08:00:00Z", STOP="2024-06-03T08:00:00Z"
+    )
     medication_row = make_medication_row(ENCOUNTER="encounter-late")
     condition_row = make_condition_row(ENCOUNTER="encounter-late")
     events: list[state.AnyEvent] = [

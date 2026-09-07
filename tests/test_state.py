@@ -100,6 +100,20 @@ def test_encounter_rejects_malformed_stop() -> None:
         state.EncounterEvent.from_row(make_encounter_row(STOP="not-a-timestamp"))
 
 
+def test_encounter_rejects_stop_before_start() -> None:
+    with pytest.raises(state.MalformedEventError):
+        state.EncounterEvent.from_row(
+            make_encounter_row(START="2026-01-10T00:00:00Z", STOP="2026-01-01T00:00:00Z")
+        )
+
+
+def test_encounter_allows_stop_equal_to_start() -> None:
+    event = state.EncounterEvent.from_row(
+        make_encounter_row(START="2026-01-10T00:00:00Z", STOP="2026-01-10T00:00:00Z")
+    )
+    assert event.stop == event.start
+
+
 @pytest.mark.parametrize("column", ["PATIENT", "ENCOUNTER", "CODE", "START"])
 def test_medication_rejects_empty_key_component(column: str) -> None:
     with pytest.raises(state.MalformedEventError):
@@ -121,6 +135,21 @@ def test_medication_rejects_malformed_stop() -> None:
         state.MedicationEvent.from_row(make_medication_row(STOP="2024-01-08"))
 
 
+def test_medication_accepts_stop_before_start() -> None:
+    """The frozen baseline holds 714 such prescriptions, so a replay must ingest them."""
+    event = state.MedicationEvent.from_row(
+        make_medication_row(START="2023-01-04T16:01:20Z", STOP="2022-12-30T16:01:20Z")
+    )
+    assert event.stop < event.start
+
+
+def test_medication_allows_stop_equal_to_start() -> None:
+    event = state.MedicationEvent.from_row(
+        make_medication_row(START="2024-01-08T08:00:00Z", STOP="2024-01-08T08:00:00Z")
+    )
+    assert event.stop == event.start
+
+
 @pytest.mark.parametrize("column", ["PATIENT", "ENCOUNTER", "SYSTEM", "CODE", "START"])
 def test_condition_rejects_empty_key_component(column: str) -> None:
     with pytest.raises(state.MalformedEventError):
@@ -135,6 +164,16 @@ def test_condition_rejects_full_timestamp_start() -> None:
 def test_condition_allows_empty_stop() -> None:
     event = state.ConditionEvent.from_row(make_condition_row(STOP=""))
     assert event.stop == ""
+
+
+def test_condition_rejects_stop_before_start() -> None:
+    with pytest.raises(state.MalformedEventError):
+        state.ConditionEvent.from_row(make_condition_row(START="2024-01-08", STOP="2024-01-07"))
+
+
+def test_condition_allows_stop_equal_to_start() -> None:
+    event = state.ConditionEvent.from_row(make_condition_row(START="2024-01-08", STOP="2024-01-08"))
+    assert event.stop == event.start
 
 
 def test_condition_allows_empty_description() -> None:

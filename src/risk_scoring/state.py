@@ -19,6 +19,14 @@ Judgment calls this module fixes:
   ``deathdate``) accept ``""`` or an exactly formatted value. Required
   timestamps and dates must round-trip through their format unchanged,
   so non-zero-padded near-misses are rejected.
+- A non-empty encounter or condition ``stop`` must not precede its
+  ``start``. Equality is allowed, since the export records zero-length
+  encounters. A reversed encounter would otherwise reach the feature
+  module as a negative length of stay and be scored and logged as if it
+  were valid. Medications are exempt: the generator emits a small share
+  of prescriptions with ``STOP`` one to six days before ``START`` (714 of
+  553,590 in the frozen baseline), the feature module reads such a row as
+  never active, and refusing it would stop a replay on generator output.
 """
 
 from __future__ import annotations
@@ -100,6 +108,14 @@ def _check_non_empty(value: str, label: str) -> None:
         raise MalformedEventError(f"{label} must not be empty")
 
 
+def _check_interval_order(start: str, stop: str, fmt: str, label: str) -> None:
+    """Require a non-empty stop at or after start; both already format-checked."""
+    if stop == "":
+        return
+    if datetime.strptime(stop, fmt) < datetime.strptime(start, fmt):
+        raise MalformedEventError(f"{label} STOP must not precede START; got {stop!r} < {start!r}")
+
+
 @dataclass(frozen=True)
 class PatientEvent:
     """Demographics row: the patient columns the cohort module reads."""
@@ -134,6 +150,7 @@ class EncounterEvent:
         _check_non_empty(self.encounter_class, "encounter ENCOUNTERCLASS")
         _check_exact_format(self.start, TIMESTAMP_FORMAT, "encounter START")
         _check_optional_format(self.stop, TIMESTAMP_FORMAT, "encounter STOP")
+        _check_interval_order(self.start, self.stop, TIMESTAMP_FORMAT, "encounter")
 
     @classmethod
     def from_row(cls, row: Mapping[str, str]) -> EncounterEvent:
@@ -193,6 +210,7 @@ class ConditionEvent:
         _check_non_empty(self.code, "condition CODE")
         _check_exact_format(self.start, DATE_FORMAT, "condition START")
         _check_optional_format(self.stop, DATE_FORMAT, "condition STOP")
+        _check_interval_order(self.start, self.stop, DATE_FORMAT, "condition")
 
     @classmethod
     def from_row(cls, row: Mapping[str, str]) -> ConditionEvent:
