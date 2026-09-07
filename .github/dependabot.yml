@@ -1,0 +1,13 @@
+version: 2
+updates:
+  # Advisories against a pinned package arrive as a pull request that bumps
+  # uv.lock, rather than as a red build once the audit step notices.
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

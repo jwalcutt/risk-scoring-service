@@ -23,3 +23,6 @@ tools/synthea/
 
 # Local Compose overrides (credentials, ports)
 .env
+
+# Lock export written by the CI audit step
+requirements-audit.txt
