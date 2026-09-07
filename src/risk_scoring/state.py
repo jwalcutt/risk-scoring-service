@@ -366,6 +366,11 @@ def _history_frame(
     return pd.DataFrame(rows, columns=list(spec.frame_columns))
 
 
+def has_patient(conn: psycopg.Connection[Any], patient_id: str) -> bool:
+    """Whether a patient's demographics are recorded; read-only, never commits."""
+    return conn.execute("SELECT 1 FROM patients WHERE id = %s", [patient_id]).fetchone() is not None
+
+
 def patient_history(conn: psycopg.Connection[Any], patient_id: str) -> PatientHistory:
     """Read one patient's full event history; read-only, never commits."""
     return PatientHistory(

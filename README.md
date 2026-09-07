@@ -60,7 +60,7 @@ GIT_SHA=$(git rev-parse HEAD) docker compose up -d --build
 
 That starts Postgres, applies the schema through a one-shot migration service, and then serves on `http://localhost:8001`. Migrations are a separate service rather than part of the service's own start, so restarting the service never issues schema changes. The commit SHA is passed in because the image carries no `.git`, and the version endpoint reports it.
 
-The service reads the model registry from the host through a read-only mount, so one registry serves training, gating, and scoring. Compose resolves the mount paths from the working directory, which is why the stack must be started from the repository root; any clone works without editing the file.
+The service reads the model registry from the host through a bind mount, so one registry serves training, gating, and scoring. The registry database is mounted read-only; the artifact store is writable because MLflow rewrites a metadata file beside a model when it loads it, and [docs/service-notes.md](docs/service-notes.md) records what that mount trusts. Compose resolves the mount paths from the working directory, which is why the stack must be started from the repository root; any clone works without editing the file.
 
 Running it as a host process instead needs Postgres and the migrations first:
 
@@ -80,7 +80,7 @@ Startup loads the model version pinned in `configs/service.toml` from the MLflow
 
 An event is `{"event_type": "...", "payload": {...}}`, where the type is one of `patient`, `encounter`, `medication`, or `condition` and the payload carries the generator columns the shared modules read. Demographics must precede a patient's first discharge, because the cohort rules need a birthdate.
 
-Posting an encounter that the cohort rules admit as an adult inpatient discharge computes that patient's features from persisted state, scores them, and writes one row to the prediction log. Everything else updates state and produces no score: medications, conditions, stays still open, and encounters the cohort rules exclude. Nothing is dropped silently: a malformed payload, a discharge arriving before its patient's demographics, and an event contradicting one already stored are all refused with a 4xx that says which.
+Posting an encounter that the cohort rules admit as an adult inpatient discharge computes that patient's features from persisted state, scores them, and writes one row to the prediction log. Everything else updates state and produces no score: medications, conditions, stays still open, and encounters the cohort rules exclude. Nothing is dropped silently: a malformed payload, a discharge arriving before its patient's demographics, and an event contradicting one already stored are all refused with a 4xx that says which. A refused event is not stored, so a 4xx never leaves behind a discharge that only a re-post could score.
 
 ## The prediction log
 

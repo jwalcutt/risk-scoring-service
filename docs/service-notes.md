@@ -113,7 +113,7 @@ Every refusal is a 4xx, and none is a silent drop:
 | An inpatient discharge whose patient has no recorded demographics | 422 | `UnknownPatientError`, naming the patient |
 | An event contradicting one already stored under the same key | 409 | `EventConflictError`, naming the key and the differing column names; the values are logged server-side only |
 
-The unknown-patient case is an ordering violation rather than a bad payload: the cohort rules need a birthdate, so demographics must precede a patient's first discharge. Reporting it rather than skipping the score is the point, since a silently unscored discharge would look identical to a cohort exclusion. The event is still stored before the refusal, so re-posting that discharge once the demographics arrive scores it normally.
+The unknown-patient case is an ordering violation rather than a bad payload: the cohort rules need a birthdate, so demographics must precede a patient's first discharge. Reporting it rather than skipping the score is the point, since a silently unscored discharge would look identical to a cohort exclusion. The check runs before the state write, so a refused discharge is not stored. An earlier version stored it first and refused afterwards, which answered 4xx for an event the service had kept: a caller who believed the refusal and never re-posted was left with a discharge that only a re-post could score, since posting the encounter is the only thing that triggers scoring. Re-posting the discharge once the demographics arrive stores and scores it normally, and a refused event of any kind now leaves nothing in state.
 
 Accepted events answer 202 rather than 200, which stays honest for the events that are not scoring events: a medication, a condition, an open stay, or a cohort-excluded encounter all update state and produce no score.
 
@@ -121,11 +121,12 @@ Accepted events answer 202 rather than 200, which stays honest for the events th
 
 `risk_scoring.service.ingest.ingest_event` is the whole path, as a plain function over a connection and a loaded model. The endpoint is a thin wrapper around it, so the replay harness can drive the same code without HTTP.
 
-1. Persist the event through `state.record_event`, which commits it on its own.
-2. If it is not an encounter, stop. Nothing but a discharge can be a scoring event.
-3. If the predictions log already holds a row for this encounter, stop.
-4. Read the patient's history and call `serving.serving_features`, which narrows the same `build_cohort` and `build_features` the training pipeline calls. A `None` means "state updated, nothing to score" for every reason at once: still open, wrong encounter class, in-hospital death, under 18.
-5. Cast the feature row to the model input columns as float64, exactly as training does, score it, and write the log row.
+1. If the event is a closed encounter, confirm the patient's demographics are in state; refuse with `UnknownPatientError` before anything is written if they are not. This is one primary-key lookup.
+2. Persist the event through `state.record_event`, which commits it on its own.
+3. If it is not an encounter, stop. Nothing but a discharge can be a scoring event.
+4. If the predictions log already holds a row for this encounter, stop.
+5. Read the patient's history and call `serving.serving_features`, which narrows the same `build_cohort` and `build_features` the training pipeline calls. A `None` means "state updated, nothing to score" for every reason at once: still open, wrong encounter class, in-hospital death, under 18.
+6. Cast the feature row to the model input columns as float64, exactly as training does, score it, and write the log row.
 
 Nothing in that sequence re-expresses a cohort or feature rule, which is what keeps "one cohort module and one feature module, shared verbatim" structural.
 
@@ -194,6 +195,10 @@ The absolute-path risk was real and is handled by construction. `configure_track
 The SQLite risk did not materialize. The database is in `delete` journal mode, not WAL, so a read needs no writable sidecar, and a read-only mount serves model resolution without complaint. `mlflow.db` is mounted read-only and stays that way.
 
 The third risk was the one that bit. Loading a `models:/name/version` URI is not a pure read: MLflow writes a derived `registered_model_meta` file beside the artifact on every load, recording the registered name and version the local copy came from. A read-only `mlruns/` fails that write with `OSError: [Errno 30] Read-only file system` before the model ever loads. `mlruns/` is therefore mounted writable while `mlflow.db` stays read-only, which is the narrowest thing that works: the container can rewrite a 48-byte derived sidecar that the host service already writes with identical content, and it cannot alter the registry itself, which is what "single source of truth" means here. Copying the artifact store into the container at startup would restore full immutability at the cost of an entrypoint script and a per-start copy; that is the recorded escalation if the artifact store ever needs to be genuinely untouchable.
+
+### What loading a model trusts
+
+The registry is local and single-user, and a loaded model is a pickled artifact: `mlflow.pyfunc.load_model` unpickles whatever the registry resolves the `models:/` URI to, and unpickling runs code. Anything that can write `mlruns/` or `mlflow.db` can therefore run code in the service at startup, and in the provenance check on the operator's machine. That is the trust model, and it matches how the registry is used: training, gating, and serving are one person's processes on one host, and the registry is that person's own files. The provenance check adds one guard because it reads the model name and version from prediction rows rather than from committed config. `provenance.model_uri` refuses a name that is anything but letters, digits, dots, underscores, and hyphens, or a version that is not a positive integer before building the URI, so a database writer can pick which registered version gets loaded but cannot point the load at a path. If the trust model ever widens beyond one host, the recorded next steps are pinning artifact hashes at promotion time and the read-only artifact copy described above.
 
 ## The container and the Compose stack
 

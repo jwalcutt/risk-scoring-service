@@ -18,8 +18,9 @@ The rules these tests pin:
   the next post. This is the crash window between the two commits, and
   closing it is what makes a resumed run gap-free.
 - An inpatient discharge whose patient has never been posted is refused
-  loudly rather than scored or silently skipped; the event is still
-  stored, so re-posting it after the demographics arrive scores it.
+  loudly rather than scored or silently skipped, and the refusal stores
+  nothing, so the 4xx means what it says. Re-posting the discharge after
+  the demographics arrive scores it.
 """
 
 from __future__ import annotations
@@ -275,15 +276,29 @@ def test_encounter_stored_without_its_score_is_scored_on_repost(
 # --- ordering violations and rejections ---
 
 
-def test_discharge_for_unknown_patient_is_refused_then_scores_once_demographics_arrive(
+def test_discharge_for_unknown_patient_is_refused_and_not_stored(
+    client: TestClient, conn: psycopg.Connection[Any]
+) -> None:
+    """A refusal must not leave the encounter behind in state.
+
+    A caller who trusts the 422 and never re-posts would otherwise hold a
+    discharge that is durably stored yet can never be scored, because only
+    posting the encounter triggers its score.
+    """
+    refused = client.post("/events", json=_discharge())
+
+    assert refused.status_code == 422
+    assert "patient-1" in refused.text
+    assert _prediction_count(conn) == 0
+    assert len(state.patient_history(conn, "patient-1").encounters) == 0
+
+
+def test_discharge_for_unknown_patient_scores_once_demographics_arrive(
     client: TestClient, conn: psycopg.Connection[Any]
 ) -> None:
     """Demographics must precede the discharge; a violation is loud, not silent."""
     refused = client.post("/events", json=_discharge())
     assert refused.status_code == 422
-    assert "patient-1" in refused.text
-    assert _prediction_count(conn) == 0
-    assert len(state.patient_history(conn, "patient-1").encounters) == 1
 
     _post(client, _patient())
     body = _post(client, _discharge())

@@ -32,7 +32,9 @@ Judgment calls this module fixes:
   caller can answer for, rather than a bare ValueError from a shared
   module. It means the event stream delivered a discharge before the
   demographics it depends on, which is an ordering violation worth
-  reporting, never a reason to skip the score.
+  reporting, never a reason to skip the score. The check is a public
+  function so the ingestion path can run it before the discharge is
+  written, and refuse without storing anything.
 """
 
 from __future__ import annotations
@@ -52,6 +54,19 @@ class UnknownEncounterError(LookupError):
 
 class UnknownPatientError(LookupError):
     """The encounter to score belongs to a patient with no recorded demographics."""
+
+
+def require_demographics(recorded: bool, encounter_id: str, patient_id: str) -> None:
+    """Raise :class:`UnknownPatientError` unless the patient's demographics are recorded.
+
+    ``recorded`` is whatever the caller knows about the patient's presence in
+    state; the error it raises names both the encounter and the patient.
+    """
+    if not recorded:
+        raise UnknownPatientError(
+            f"encounter {encounter_id!r} belongs to patient {patient_id!r}, whose "
+            "demographics have not been recorded; the cohort rules need a birthdate"
+        )
 
 
 @dataclass(frozen=True)
@@ -76,12 +91,7 @@ def serving_features(history: PatientHistory, encounter_id: str) -> ScoringInput
         raise UnknownEncounterError(f"encounter {encounter_id!r} is not in the patient's history")
     if scored["STOP"].iloc[0] == "":
         return None
-    if history.patients.empty:
-        patient = scored["PATIENT"].iloc[0]
-        raise UnknownPatientError(
-            f"encounter {encounter_id!r} belongs to patient {patient!r}, whose "
-            "demographics have not been recorded; the cohort rules need a birthdate"
-        )
+    require_demographics(not history.patients.empty, encounter_id, scored["PATIENT"].iloc[0])
 
     cohort = build_cohort(scored, history.patients).frame
     if cohort.empty:
