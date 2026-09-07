@@ -12,6 +12,12 @@ Judgment calls this module fixes:
   pipeline calls, and a ``None`` from it means "state updated, nothing to
   score" for every reason at once (still open, wrong class, in-hospital
   death, under 18).
+- A closed encounter whose patient has no demographics is refused before
+  it is written. The state write commits on its own, so a refusal raised
+  after it would answer 4xx for an event the service had kept, and a
+  caller who believed the refusal would leave that discharge stored and
+  never scored. Checking first costs one primary-key lookup, and a
+  re-post after the demographics arrive stores and scores it as normal.
 - The prediction log, not the state write, decides whether to score.
   State commits per event, so an encounter can be durable while its score
   is not; asking the log instead makes that window self-healing and costs
@@ -68,8 +74,13 @@ def ingest_event(
     Raises :class:`risk_scoring.state.EventConflictError` when the event
     contradicts one already stored, and
     :class:`risk_scoring.serving.UnknownPatientError` when a discharge
-    arrives before its patient's demographics.
+    arrives before its patient's demographics. Neither refusal stores the
+    event.
     """
+    if isinstance(event, state.EncounterEvent) and event.stop != "":
+        serving.require_demographics(
+            state.has_patient(conn, event.patient), event.id, event.patient
+        )
     stored = state.record_event(conn, event)
     if not isinstance(event, state.EncounterEvent):
         return IngestResult(stored, *_NOT_SCORED)

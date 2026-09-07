@@ -24,11 +24,16 @@ Judgment calls this module fixes:
   where something subtly wrong looks fine.
 - A features dict missing a model column raises rather than filling in a
   default, which would turn a provenance break into a plausible number.
+- The model name and version a row carries are checked against the shape
+  of a registry reference before they become a ``models:/`` URI. Loading
+  a model deserializes a pickled artifact, so a row must not be able to
+  steer the load anywhere but a registered name and a version number.
 """
 
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,6 +48,27 @@ from risk_scoring.payload_hash import payload_hash
 from risk_scoring.predictions import StoredPrediction
 from risk_scoring.stream import EVENT_FIELDS
 from risk_scoring.tracking import configure_tracking
+
+# A registered model name as this repository writes them: it starts with a
+# letter or digit and continues with letters, digits, dots, underscores, or
+# hyphens. No separators, so a name cannot become a path or a second URI
+# segment.
+REGISTERED_MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+
+
+def model_uri(model_name: str, model_version: int) -> str:
+    """The ``models:/`` URI for a registered version, after checking both parts.
+
+    Raises ``ValueError`` when the name is not a registered model name or
+    the version is not a positive integer, so a value read from a database
+    row cannot name an arbitrary artifact to deserialize.
+    """
+    if not isinstance(model_name, str) or REGISTERED_MODEL_NAME.fullmatch(model_name) is None:
+        raise ValueError(f"model name {model_name!r} is not a registered model name")
+    # bool is an int subclass, so check it explicitly.
+    if isinstance(model_version, bool) or not isinstance(model_version, int) or model_version < 1:
+        raise ValueError(f"model version {model_version!r} is not a positive integer")
+    return f"models:/{model_name}/{model_version}"
 
 
 @dataclass(frozen=True)
@@ -143,7 +169,7 @@ def verify_predictions(
     for prediction in predictions:
         if prediction.encounter_id not in rows:
             raise KeyError(f"no source row for encounter {prediction.encounter_id}")
-        uri = f"models:/{prediction.model_name}/{prediction.model_version}"
+        uri = model_uri(prediction.model_name, prediction.model_version)
         if uri not in loaded:
             loaded[uri] = mlflow.pyfunc.load_model(uri)
         checks.append(

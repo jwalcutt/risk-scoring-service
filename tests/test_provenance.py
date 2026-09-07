@@ -22,9 +22,11 @@ from risk_scoring.payload_hash import payload_hash
 from risk_scoring.predictions import StoredPrediction
 from risk_scoring.provenance import (
     ProvenanceCheck,
+    model_uri,
     recompute_input_hash,
     rescore,
     source_event,
+    verify_predictions,
 )
 from risk_scoring.stream import EVENT_FIELDS
 
@@ -128,6 +130,38 @@ def test_rescoring_rejects_a_features_dict_missing_a_model_column() -> None:
     del incomplete["los_days"]
     with pytest.raises(KeyError, match="los_days"):
         rescore(RecordingModel(), incomplete)
+
+
+# The model reference
+
+
+def test_the_model_uri_names_the_registered_version() -> None:
+    assert model_uri("readmission-risk", 3) == "models:/readmission-risk/3"
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["", "../evil", "readmission risk", "readmission/risk", "-leading", "name\n", "a" * 256],
+)
+def test_a_model_name_outside_the_registered_shape_is_refused(name: str) -> None:
+    """A row can name any string; only a registry-shaped name may become a load."""
+    with pytest.raises(ValueError, match="model name"):
+        model_uri(name, 3)
+
+
+@pytest.mark.parametrize("version", [0, -1, "3", True, 3.0])
+def test_a_model_version_that_is_not_a_positive_integer_is_refused(version: Any) -> None:
+    with pytest.raises(ValueError, match="model version"):
+        model_uri("readmission-risk", version)
+
+
+def test_verification_refuses_a_row_naming_a_malformed_model(tmp_path: Any) -> None:
+    """The refusal comes before anything is loaded from the registry."""
+    row = make_encounter_row(Id="e1", PATIENT="p1")
+    encounters = pd.DataFrame([row])
+
+    with pytest.raises(ValueError, match="model name"):
+        verify_predictions([stored(model_name="../evil")], encounters, tmp_path)
 
 
 # The verdict

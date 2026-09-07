@@ -32,8 +32,12 @@ services:
     image: risk-scoring-service:dev
     command: ["python", "-m", "risk_scoring.db", "migrate"]
     environment:
+      # The service follows POSTGRES_DB, so setting that alone renames the
+      # whole stack's database. SERVICE_DB overrides it for the check
+      # scripts, which point the app at a throwaway database they created
+      # on the same server (scripts/compose_support.py).
       RISK_SCORING_DATABASE_URL: &service-dsn
-        postgresql://${POSTGRES_USER:-risk}:${POSTGRES_PASSWORD:-risk}@postgres:5432/${SERVICE_DB:-risk_scoring}
+        postgresql://${POSTGRES_USER:-risk}:${POSTGRES_PASSWORD:-risk}@postgres:5432/${SERVICE_DB:-${POSTGRES_DB:-risk_scoring}}
     depends_on:
       postgres:
         condition: service_healthy
