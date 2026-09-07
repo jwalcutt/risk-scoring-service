@@ -8,8 +8,16 @@ posts by, so the two sides are exact complements.
 
 from __future__ import annotations
 
+import pandas as pd
+
+from factories import (
+    CONDITION_DEFAULTS,
+    ENCOUNTER_DEFAULTS,
+    MEDICATION_DEFAULTS,
+    make_encounter_row,
+)
 from risk_scoring.replay.preload import history_before, replay_from
-from risk_scoring.stream import StreamEvent
+from risk_scoring.stream import StreamEvent, ordered_events
 
 BEFORE = "2025-01-01T00:00:00Z"
 
@@ -69,3 +77,14 @@ def test_the_two_sides_are_exact_complements_of_the_stream() -> None:
 
 def test_replay_from_an_empty_stream_is_empty() -> None:
     assert replay_from([], BEFORE) == []
+
+
+def test_an_open_stay_is_never_history() -> None:
+    """State must not hold an open stay before the events that precede it."""
+    open_stay = make_encounter_row(Id="open", START="2024-06-01T08:00:00Z", STOP="")
+    medications = pd.DataFrame(columns=list(MEDICATION_DEFAULTS))
+    conditions = pd.DataFrame(columns=list(CONDITION_DEFAULTS))
+    encounters = pd.DataFrame([open_stay], columns=list(ENCOUNTER_DEFAULTS))
+    events = ordered_events(encounters, medications, conditions)
+    assert history_before(events, BEFORE) == []
+    assert replay_from(events, BEFORE) == events

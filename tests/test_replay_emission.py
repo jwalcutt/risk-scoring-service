@@ -12,8 +12,16 @@ Pure: no database, no clock, no HTTP. The rules these tests pin:
 
 from __future__ import annotations
 
+import pandas as pd
+
+from factories import (
+    CONDITION_DEFAULTS,
+    ENCOUNTER_DEFAULTS,
+    MEDICATION_DEFAULTS,
+    make_encounter_row,
+)
 from risk_scoring.replay.emission import due_events
-from risk_scoring.stream import StreamEvent
+from risk_scoring.stream import StreamEvent, ordered_events
 
 
 def _event(at: str, identity: str, kind: str = "encounter") -> StreamEvent:
@@ -96,3 +104,15 @@ def test_a_cursor_between_two_events_resumes_at_the_later_one() -> None:
     after = _event("2025-03-01T10:00:00Z", "after")
     removed = _event("2025-03-01T09:30:00Z", "removed")
     assert due_events([before, after], removed.sort_key, NOON) == [after]
+
+
+def test_an_open_stay_is_never_due() -> None:
+    """A stay with no discharge yet has nothing to post, however far the clock runs."""
+    open_stay = make_encounter_row(Id="open", START="2025-02-01T08:00:00Z", STOP="")
+    closed = make_encounter_row(Id="closed", STOP="2025-03-01T08:00:00Z")
+    medications = pd.DataFrame(columns=list(MEDICATION_DEFAULTS))
+    conditions = pd.DataFrame(columns=list(CONDITION_DEFAULTS))
+    encounters = pd.DataFrame([open_stay, closed], columns=list(ENCOUNTER_DEFAULTS))
+    events = ordered_events(encounters, medications, conditions)
+    due = due_events(events, None, "2099-12-31T23:59:59Z")
+    assert [event.row["Id"] for event in due] == ["closed"]
