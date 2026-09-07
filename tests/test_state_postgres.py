@@ -472,3 +472,136 @@ def test_a_read_back_that_never_finds_the_row_gives_up_after_a_bounded_number_of
     assert 1 < tampered.read_backs <= 5
     # The failed attempt rolled back, so the connection is still usable.
     assert _record(tampered, "encounter", make_encounter_row(Id="encounter-2")) is True
+
+
+# The per-patient event cap.
+
+
+def _events(patient: str, count: int) -> list[state.AnyEvent]:
+    return [
+        state.MedicationEvent.from_row(make_medication_row(PATIENT=patient, CODE=f"drug-{i}"))
+        for i in range(count)
+    ]
+
+
+def test_an_event_past_the_patient_cap_is_refused_and_not_stored(
+    db_conn: psycopg.Connection[Any],
+) -> None:
+    first, second, third = _events("patient-1", 3)
+    assert state.record_event(db_conn, first, max_patient_rows=2) is True
+    assert state.record_event(db_conn, second, max_patient_rows=2) is True
+
+    with pytest.raises(state.PatientEventLimitError, match=r"patient-1.*\b2\b"):
+        state.record_event(db_conn, third, max_patient_rows=2)
+
+    assert state.patient_history(db_conn, "patient-1").medications["CODE"].tolist() == [
+        "drug-0",
+        "drug-1",
+    ]
+    # The connection is still usable.
+    assert state.record_event(db_conn, _events("patient-2", 1)[0], max_patient_rows=2) is True
+
+
+def test_a_repost_at_the_cap_is_still_a_noop(db_conn: psycopg.Connection[Any]) -> None:
+    """A resumed replay re-posts what it already sent; the cap must not turn that into a refusal."""
+    first, second = _events("patient-1", 2)
+    state.record_event(db_conn, first, max_patient_rows=2)
+    state.record_event(db_conn, second, max_patient_rows=2)
+
+    assert state.record_event(db_conn, second, max_patient_rows=2) is False
+
+
+def test_the_cap_counts_every_clinical_event_kind_but_not_demographics(
+    db_conn: psycopg.Connection[Any],
+) -> None:
+    encounter = state.EncounterEvent.from_row(make_encounter_row(ENCOUNTERCLASS="inpatient"))
+    condition = state.ConditionEvent.from_row(make_condition_row())
+    (medication,) = _events("patient-1", 1)
+    demographics = state.PatientEvent.from_row(make_patient_row())
+    state.record_event(db_conn, encounter, max_patient_rows=2)
+    state.record_event(db_conn, condition, max_patient_rows=2)
+
+    with pytest.raises(state.PatientEventLimitError):
+        state.record_event(db_conn, medication, max_patient_rows=2)
+    assert state.record_event(db_conn, demographics, max_patient_rows=2) is True
+
+
+def test_no_cap_means_no_limit(db_conn: psycopg.Connection[Any]) -> None:
+    for event in _events("patient-1", 5):
+        assert state.record_event(db_conn, event) is True
+
+
+# Bounded read-back, for scoring one discharge without loading a lifetime.
+
+
+DISCHARGE_WINDOW = state.HistoryWindow(
+    encounter_stop_from="2023-06-02T08:00:00Z",
+    discharge="2024-06-05T08:00:00Z",
+    discharge_date="2024-06-05",
+)
+
+
+def _stay(encounter_id: str, stop: str, start: str = "2023-01-01T08:00:00Z") -> dict[str, str]:
+    return make_encounter_row(Id=encounter_id, ENCOUNTERCLASS="inpatient", START=start, STOP=stop)
+
+
+def test_windowed_history_keeps_the_rows_a_discharge_can_read_and_no_others(
+    db_conn: psycopg.Connection[Any],
+) -> None:
+    """Each bound is probed a second, or a day, to either side.
+
+    Encounters are read by STOP between the lookback floor and the
+    discharge instant, both inclusive; an open stay has no STOP and is
+    invisible to every feature. Medications are read when started at or
+    before the discharge and stopped after it or never. Conditions are
+    read when started on or before the discharge date, however long ago
+    and resolved or not, because the comorbidity flags read resolved
+    history.
+    """
+    _record(db_conn, "patient", make_patient_row())
+    for encounter_id, stop in [
+        ("e-before-floor", "2023-06-02T07:59:59Z"),
+        ("e-on-floor", "2023-06-02T08:00:00Z"),
+        ("e-scored", "2024-06-05T08:00:00Z"),
+        ("e-after-discharge", "2024-06-05T08:00:01Z"),
+        ("e-open", ""),
+    ]:
+        _record(db_conn, "encounter", _stay(encounter_id, stop))
+    for code, start, stop in [
+        ("m-stopped-at-discharge", "2024-01-01T08:00:00Z", "2024-06-05T08:00:00Z"),
+        ("m-stopped-after", "2024-01-01T08:00:00Z", "2024-06-05T08:00:01Z"),
+        ("m-open", "2024-01-01T08:00:00Z", ""),
+        ("m-started-at-discharge", "2024-06-05T08:00:00Z", ""),
+        ("m-started-after", "2024-06-05T08:00:01Z", ""),
+    ]:
+        _record(db_conn, "medication", make_medication_row(CODE=code, START=start, STOP=stop))
+    for code, start, stop in [
+        ("c-on-discharge-date", "2024-06-05", ""),
+        ("c-day-after", "2024-06-06", ""),
+        ("c-resolved-years-ago", "2015-01-01", "2015-02-01"),
+    ]:
+        _record(db_conn, "condition", make_condition_row(CODE=code, START=start, STOP=stop))
+
+    history = state.patient_history(db_conn, "patient-1", DISCHARGE_WINDOW)
+
+    assert history.patients["Id"].tolist() == ["patient-1"]
+    assert history.encounters["Id"].tolist() == ["e-on-floor", "e-scored"]
+    assert history.medications["CODE"].tolist() == [
+        "m-open",
+        "m-stopped-after",
+        "m-started-at-discharge",
+    ]
+    assert history.conditions["CODE"].tolist() == ["c-resolved-years-ago", "c-on-discharge-date"]
+
+
+def test_unwindowed_history_is_the_whole_record(db_conn: psycopg.Connection[Any]) -> None:
+    _record(
+        db_conn, "encounter", _stay("e-ancient", "2001-01-01T08:00:00Z", "2000-12-30T08:00:00Z")
+    )
+    _record(db_conn, "encounter", _stay("e-open", ""))
+    _record(db_conn, "condition", make_condition_row(START="2030-01-01", STOP=""))
+
+    history = state.patient_history(db_conn, "patient-1")
+
+    assert history.encounters["Id"].tolist() == ["e-ancient", "e-open"]
+    assert len(history.conditions) == 1

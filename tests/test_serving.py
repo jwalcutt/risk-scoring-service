@@ -199,3 +199,36 @@ def test_features_ignore_events_recorded_after_the_scored_discharge() -> None:
     assert row["prior_inpatient_180d"] == 1
     assert row["active_medication_count"] == 0
     assert row["active_disorder_count"] == 0
+
+
+# --- the history window one discharge is scored from ---
+
+
+def test_history_window_runs_from_the_lookback_before_admission_to_the_discharge() -> None:
+    """Admitted 2024-06-01, so 365 days earlier, across the leap day, is 2023-06-02."""
+    discharge = state.EncounterEvent(
+        id="encounter-index",
+        start="2024-06-01T08:00:00Z",
+        stop="2024-06-05T17:30:00Z",
+        patient="patient-1",
+        encounter_class="inpatient",
+    )
+
+    assert serving.history_window(discharge) == state.HistoryWindow(
+        encounter_stop_from="2023-06-02T08:00:00Z",
+        discharge="2024-06-05T17:30:00Z",
+        discharge_date="2024-06-05",
+    )
+
+
+def test_an_open_stay_has_no_history_window() -> None:
+    """No discharge instant, nothing to bound against, and nothing to score."""
+    open_stay = state.EncounterEvent(
+        id="encounter-open",
+        start="2024-06-01T08:00:00Z",
+        stop="",
+        patient="patient-1",
+        encounter_class="inpatient",
+    )
+
+    assert serving.history_window(open_stay) is None

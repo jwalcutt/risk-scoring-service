@@ -46,6 +46,7 @@ from factories import (
     make_medication_row,
 )
 from risk_scoring.features import (
+    ENCOUNTER_LOOKBACK_DAYS,
     FEATURE_COLUMNS,
     FEATURE_VERSION,
     MODEL_INPUT_COLUMNS,
@@ -317,6 +318,32 @@ def test_ed_visit_ending_at_the_discharge_instant_does_not_count() -> None:
 def test_ed_visit_after_discharge_is_invisible() -> None:
     row = single(encounters=[ed_visit("2024-06-10T12:00:00Z")])
     assert row["prior_ed_180d"] == 0
+
+
+# --- the encounter lookback ---
+
+ENCOUNTER_FEATURES = ("prior_inpatient_180d", "days_since_prev_discharge", "prior_ed_180d")
+
+
+def test_encounters_ending_just_beyond_the_lookback_read_as_no_history() -> None:
+    """A stay or visit ending a second past the lookback before admission changes nothing.
+
+    The gap it would set clips to the 365-day cap, which is also the
+    no-history sentinel, and it lies far outside the 180-day window that
+    ends at discharge. Serving relies on this to leave such rows unread.
+    """
+    beyond = iso_before(SCORE_START, timedelta(days=ENCOUNTER_LOOKBACK_DAYS, seconds=1))
+    with_history = single(encounters=[prior_stay(beyond), ed_visit(beyond)])
+    without_history = single()
+
+    for column in ENCOUNTER_FEATURES:
+        assert with_history[column] == without_history[column], column
+
+
+def test_a_stay_ending_just_inside_the_lookback_is_read() -> None:
+    inside = iso_before(SCORE_START, timedelta(days=ENCOUNTER_LOOKBACK_DAYS, seconds=-1))
+    row = single(encounters=[prior_stay(inside)])
+    assert row["days_since_prev_discharge"] < 365.0
 
 
 # --- active medication count ---

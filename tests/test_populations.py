@@ -219,7 +219,7 @@ def test_rekeyed_is_invisible_to_the_shared_modules(skew: dict[str, pd.DataFrame
                 frame[column] = frame[column].map(lambda value: rekey_id("variant", value))
         return frame.sort_values("encounter_id").reset_index(drop=True)
 
-    assert len(cohort) == 13
+    assert len(cohort) == 19
     for original, rewritten in (
         (cohort, cohort_out),
         (features, features_out),

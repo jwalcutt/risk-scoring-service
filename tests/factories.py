@@ -400,6 +400,13 @@ def write_skew_population(csv_dir: Path) -> int:
     patients are excluded outright: a minor, an in-hospital death, and
     one with no inpatient encounter.
 
+    Three more patients probe the lookback that serving reads encounters
+    back to, 365 days before the admission: a prior stay ending one
+    second inside it, one ending exactly on it, and one ending one
+    second beyond it, each the patient's only history. The medication
+    rows probe the discharge instant the same way, with prescriptions
+    stopping one second after it and starting exactly on it.
+
     Returns the number of encounters the cohort rules admit.
     """
     patients = [
@@ -409,6 +416,9 @@ def write_skew_population(csv_dir: Path) -> int:
         make_patient_row(Id="p-readmit", BIRTHDATE="1962-07-07"),
         make_patient_row(Id="p-full", BIRTHDATE="1951-09-30"),
         make_patient_row(Id="p-twin", BIRTHDATE="1966-04-12"),
+        make_patient_row(Id="p-floor-in", BIRTHDATE="1966-04-04"),
+        make_patient_row(Id="p-floor-on", BIRTHDATE="1959-12-12"),
+        make_patient_row(Id="p-floor-out", BIRTHDATE="1973-08-08"),
         make_patient_row(Id="p-minor", BIRTHDATE="2008-06-01"),
         make_patient_row(Id="p-died", BIRTHDATE="1940-01-01", DEATHDATE="2024-03-12"),
         make_patient_row(Id="p-outpatient", BIRTHDATE="1975-01-01"),
@@ -449,6 +459,23 @@ def write_skew_population(csv_dir: Path) -> int:
         stay("e-twin-earlier", "p-twin", "2023-12-28T10:00:00Z", "2024-01-01T10:00:00Z"),
         stay("e-twin-a", "p-twin", "2024-01-10T10:00:00Z", "2024-01-14T10:00:00Z"),
         stay("e-twin-b", "p-twin", "2024-01-12T10:00:00Z", "2024-01-14T10:00:00Z"),
+        # Admitted 2024-03-01T08:00:00Z, so the lookback floor, 365 days
+        # earlier across the leap day, is 2023-03-02T08:00:00Z. Each prior
+        # stay is its patient's only history, so the gap it sets is the
+        # whole difference between reading it and not.
+        stay("e-floor-in-prior", "p-floor-in", "2023-02-28T08:00:00Z", "2023-03-02T08:00:01Z"),
+        stay("e-floor-in-index", "p-floor-in", "2024-03-01T08:00:00Z", "2024-03-03T08:00:00Z"),
+        stay("e-floor-on-prior", "p-floor-on", "2023-02-28T08:00:00Z", "2023-03-02T08:00:00Z"),
+        stay("e-floor-on-index", "p-floor-on", "2024-03-01T08:00:00Z", "2024-03-03T08:00:00Z"),
+        stay("e-floor-out-prior", "p-floor-out", "2023-02-28T08:00:00Z", "2023-03-02T07:59:59Z"),
+        stay(
+            "e-floor-out-ed",
+            "p-floor-out",
+            "2023-03-02T04:00:00Z",
+            "2023-03-02T07:59:59Z",
+            "emergency",
+        ),
+        stay("e-floor-out-index", "p-floor-out", "2024-03-01T08:00:00Z", "2024-03-03T08:00:00Z"),
         stay("e-minor", "p-minor", "2024-01-02T08:00:00Z", "2024-01-05T08:00:00Z"),
         stay("e-died", "p-died", "2024-03-08T08:00:00Z", "2024-03-12T08:00:00Z"),
         stay(
@@ -478,6 +505,10 @@ def write_skew_population(csv_dir: Path) -> int:
         prescription("310798", "2024-07-02T06:00:00Z", "2024-09-15T06:00:00Z"),
         prescription("314076", "2024-07-03T06:00:00Z", "2024-09-01T06:00:00Z"),
         prescription("861007", "2024-06-01T06:00:00Z", "2024-07-15T06:00:00Z"),
+        # Stopping one second after the discharge instant means active.
+        prescription("312961", "2024-07-10T06:00:00Z", "2024-08-05T06:00:01Z"),
+        # Starting exactly at the discharge instant means active too.
+        prescription("617314", "2024-08-05T06:00:00Z", ""),
         # Prescribed the day after discharge: invisible to the scored row.
         prescription("197361", "2024-08-06T06:00:00Z", ""),
     ]
@@ -515,7 +546,7 @@ def write_skew_population(csv_dir: Path) -> int:
     write_rows_csv(csv_dir / "encounters.csv", encounters)
     write_rows_csv(csv_dir / "medications.csv", medications)
     write_rows_csv(csv_dir / "conditions.csv", conditions)
-    return 13
+    return 19
 
 
 def write_splice_population(csv_dir: Path) -> int:

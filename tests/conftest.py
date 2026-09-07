@@ -130,8 +130,8 @@ def trained_repo(
     checks that two runs agree is only as strong as the spread of scores the
     model produces. A model that returns one number for every input satisfies
     all of those assertions without exercising anything. This population
-    lands mid-band and gives six distinct scores across the ten discharges
-    the service tests ingest; ``test_trained_fixture.py`` keeps it that way.
+    lands mid-band and spreads scores across the discharges the service
+    tests ingest; ``test_trained_fixture.py`` keeps it that way.
     """
     old_tracking = mlflow.get_tracking_uri()
     old_registry = mlflow.get_registry_uri()

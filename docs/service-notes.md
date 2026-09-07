@@ -56,7 +56,7 @@ Each record call commits its own row. An acknowledged event must be a persisted 
 
 ## Serving-time features and the skew check
 
-`risk_scoring.serving.serving_features` computes one discharge's scoring input from that patient's recorded history. It calls the same two functions the training pipeline calls: `cohort.build_cohort` decides admission and `features.build_features` computes the row. Neither rule is restated. The cohort check runs over the single encounter being scored, since every cohort rule is per-encounter; feature computation receives the whole history, because prior encounters, medications, and conditions are what the features read. Nothing was extracted from the shared modules to make this work, so "one cohort module and one feature module, shared verbatim" stays structural rather than a claim a test has to chase.
+`risk_scoring.serving.serving_features` computes one discharge's scoring input from that patient's recorded history. It calls the same two functions the training pipeline calls: `cohort.build_cohort` decides admission and `features.build_features` computes the row. Neither rule is restated. The cohort check runs over the single encounter being scored, since every cohort rule is per-encounter; feature computation receives the prior encounters, medications, and conditions the features read, which since 2026-09-06 is the part of the history inside the window described under "Bounding the history one score reads" rather than the whole record. Nothing was extracted from the shared modules to make this work, so "one cohort module and one feature module, shared verbatim" stays structural rather than a claim a test has to chase.
 
 Two behaviors the serving seam fixes on its own. An encounter still open at ingestion, with an empty `STOP`, is not a scoring event and yields nothing: a completed CSV export contains no such row, so the cohort module never sees one, and admitting it would anchor a feature row to a missing timestamp. Asking to score an encounter that state has no row for raises instead of returning nothing, because a silent exclusion there would make a lost ingestion look like a routine cohort rejection.
 
@@ -79,6 +79,40 @@ Two things this run surfaced:
 Medications and conditions are posted once, at their `START`, carrying the `STOP` they will eventually have. State therefore knows a prescription's end date before it arrives. No feature reads it early, because `STOP` is only ever compared against the discharge instant, so there is no leak today. A replay harness that instead posted a medication open and closed it later would collide with the key design, since a medication's key is its whole payload and the close would land as a second row rather than an update. Whether ingestion needs update semantics is a question for the replay harness, not for the data spine.
 
 Pandas emitted one `UserWarning` per run about falling back from datetime format inference, raised by a single patient in the 500-patient sample whose medication start timestamps defeat the format guess: `guess_datetime_format` returns `None` when a value's minute field repeats two digits of its year, as in `2007-02-09T20:07:18Z`, so the whole column goes through `dateutil` element by element. Seven of the 11,064 baseline patients with medications hit that shape. The fallback parsed every value identically, and explicit-format parsing was checked against inferred parsing for all eight timestamp columns of all three frozen populations with no value differing, so this was a latent hazard rather than a present defect. Inference also made rejection depend on the luck of the first row: with a guessable first element pandas applies the guess strictly and rejects a malformed value, while with an unguessable one the same value reaches `dateutil` and is quietly accepted. `risk_scoring.cohort`, `risk_scoring.features`, and `risk_scoring.labels` now pin the export's formats, `%Y-%m-%dT%H:%M:%SZ` for encounter and medication timestamps and `%Y-%m-%d` for condition dates and patient birth and death dates, matching what `risk_scoring.state` already enforces at event construction. Every `pd.to_datetime` call in `src` and `scripts` now carries an explicit format, and a non-conforming value raises instead of being reinterpreted. The full baseline feature frame, 12,308 discharges over 16 columns, and the full baseline label frame, the same 12,308 discharges carrying 1,557 positives, are both bit-identical before and after the change, and this run reproduces with warnings escalated to errors.
+
+## Bounding the history one score reads
+
+Recorded 2026-09-06. Until this change, scoring a discharge read the patient's whole record and handed it to `build_features`, which then ignored most of it. The cost of every event therefore grew with the length of the patient's history, and the endpoint takes events without credentials, so a client could make one patient id as expensive as it liked by posting to it: the nth event paid for reloading and re-featurizing the n-1 before it. Recomputing from raw history is still the right design, and this note does not revisit it; what changed is how much of that history one score reads.
+
+`serving.history_window` derives a window from the discharge being scored, and `state.patient_history` applies it to each table:
+
+| Table | Rows read | Why that is every row a feature reads |
+| --- | --- | --- |
+| `encounters` | STOP from 365 days before the admission START through the discharge instant, both inclusive | The 180-day counts end at the discharge and the gap runs from the admission, and START never follows STOP, so the longer span measured from START covers both. A stay ending earlier either sets a gap that clips to the 365-day cap, which is also the no-history sentinel, or sets nothing at all. A stay ending later is already invisible to `build_features`. An open stay has no STOP and is invisible to every feature. |
+| `medications` | START at or before the discharge instant, STOP after it or empty | The only medication feature is the count active at that instant, defined exactly this way. |
+| `conditions` | START on or before the discharge date, with no lower bound | The active count and the flags read only conditions recorded by the discharge date. The flags read resolved history from any year, so a lower bound would change them, and this table is left unbounded below on purpose. |
+| `patients` | the one row | |
+
+`features.ENCOUNTER_LOOKBACK_DAYS` states the encounter bound beside the two windows it covers, so a change to either window moves the bound with it. The bounds are compared against the stored strings, which works because the export's timestamp formats sort lexicographically in time order, the same property the by-patient indexes already rely on.
+
+The argument above is not the proof; the skew test is. The synthetic population now carries a prior stay ending one second inside the lookback, one ending exactly on it, and one ending a second beyond it, each its patient's only history, together with a prescription stopping one second after the discharge and one starting exactly on it. The serving path reads through the window and must equal the batch pipeline exactly on all 16 discharges. `tests/test_state_postgres.py` probes each bound a second, or a day, to either side at the read itself, and `scripts/check_serving_skew.py` scores through the same window, so the next run against generated data checks the bounded read. The 500-patient run recorded above predates the window and was made with the unbounded read.
+
+No index was added. `encounters` already carries `(patient, start)` and the medication and condition primary keys lead with the patient id, so every by-patient read was index-served before this change; the window filters within that range, and at a few hundred rows per generated patient the filter is not where the time goes. The pandas work over the loaded frames is, and that is what the window shrinks.
+
+## The per-patient event cap
+
+The window bounds what one score reads from the encounter and medication tables. It does not bound the condition table, and nothing bounded how many rows a patient id could hold at all. `configs/service.toml` now carries a `[limits]` table:
+
+```toml
+[limits]
+max_events_per_patient = 20000
+```
+
+That is the number of encounters, medications, and conditions one patient id may hold in state. Demographics are one row per id and never count. A new clinical event that would take the patient past the cap answers 409 with a detail naming the patient and the cap, and nothing is stored: the count runs inside the insert's own transaction, after the insert and before the commit, so it is exact for that connection and costs one round trip over the three patient-leading btrees, and a count past the cap rolls the insert back. A re-post of an event the patient already holds is not new and never reaches the count, so a resumed replay sitting at exactly the cap stays a no-op rather than turning into a refusal. `record_batch`, which the replay harness uses to preload history from the frozen export, applies no cap: it reads a checksum-verified file, not the network. The table is optional in the TOML and the module default applies without it, because a service with no stated cap is safer with the default than with none; a cap that is present must be a positive integer.
+
+The status is 409 rather than 413 or 429. The request is not too large and the client is not too fast; the refusal depends on what is already stored under that id, exactly as the conflict does, and re-sending the same request cannot succeed.
+
+The value was sized from the frozen populations, not from what the service can bear. Their manifests put the average at 145 rows per patient in baseline, 148 in care_protocol, and 338 in demographic_shift, and the largest single patient posted in any recorded run carried 826 events. Twenty thousand sits roughly twenty-five times above that patient. A test holds the committed value at ten times the largest recorded patient or more, so lowering it below what generated data needs fails in CI rather than in a replay. The default is deliberately not a performance figure: it is a size no generated patient reaches, so an operator lowering it is tightening a guard rather than tuning one.
 
 ## Running the service
 
@@ -112,6 +146,7 @@ Every refusal of an event is a 4xx, and none is a silent drop. The one other non
 | A value that fails its exact format, an empty identity field, or an encounter or condition `STOP` before its `START` | 422 | `MalformedEventError` from the state layer, raised at conversion |
 | An inpatient discharge whose patient has no recorded demographics | 422 | `UnknownPatientError`, naming the patient |
 | An event contradicting one already stored under the same key | 409 | `EventConflictError`, naming the key and the differing column names; the values are logged server-side only |
+| A new clinical event for a patient id already holding the configured maximum | 409 | `PatientEventLimitError`, naming the patient and the cap |
 | A body over `MAX_EVENT_BYTES`, 1 MiB | 413 | `EventBodyLimit` middleware, before the body is buffered |
 | Every pooled connection stayed busy for the whole wait | 503 | `PoolTimeout` from the pool; post the event again, which is a no-op for whatever was stored |
 
@@ -125,11 +160,11 @@ Accepted events answer 202 rather than 200, which stays honest for the events th
 
 `risk_scoring.service.ingest.ingest_event` is the whole path, as a plain function over a connection and a loaded model. The endpoint is a thin wrapper around it, so the replay harness can drive the same code without HTTP.
 
-1. If the event is a closed encounter, confirm the patient's demographics are in state; refuse with `UnknownPatientError` before anything is written if they are not. This is one primary-key lookup.
+1. If the event is a closed encounter, confirm the patient's demographics are in state; refuse with `UnknownPatientError` before anything is written if they are missing.
 2. Persist the event through `state.record_event`, which commits it on its own.
 3. If it is not an encounter, stop. Nothing but a discharge can be a scoring event.
 4. If the predictions log already holds a row for this encounter, stop.
-5. Read the patient's history and call `serving.serving_features`, which narrows the same `build_cohort` and `build_features` the training pipeline calls. A `None` means "state updated, nothing to score" for every reason at once: still open, wrong encounter class, in-hospital death, under 18.
+5. Read the patient's history through the window `serving.history_window` derives from the discharge, and call `serving.serving_features`, which narrows the same `build_cohort` and `build_features` the training pipeline calls. A stay still open has no window and stops here. A `None` from `serving_features` means "state updated, nothing to score" for every other reason at once: wrong encounter class, in-hospital death, under 18.
 6. Cast the feature row to the model input columns as float64, exactly as training does, score it, and write the log row.
 
 Nothing in that sequence re-expresses a cohort or feature rule, which is what keeps "one cohort module and one feature module, shared verbatim" structural.

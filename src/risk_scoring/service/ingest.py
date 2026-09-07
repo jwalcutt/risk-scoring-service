@@ -35,6 +35,10 @@ Judgment calls this module fixes:
   is not; asking the log instead makes that window self-healing and costs
   one indexed lookup per encounter. It also means a discharge is never
   scored twice, no matter how often the stream replays it.
+- History is read through ``serving.history_window``, the rows the
+  discharge's features can see, rather than the patient's whole record.
+  The cost of scoring one discharge is then bounded by the window, not
+  by how many events the patient has accumulated.
 - The score is computed from the same frame the training pipeline builds,
   cast the same way, so the model sees the columns its signature
   declares and the logged feature values are the model's actual input.
@@ -92,7 +96,9 @@ def ingest_event(
     when there is a score to log, once more for the log write; no
     connection is held while the model runs. Raises
     :class:`risk_scoring.state.EventConflictError` when the event
-    contradicts one already stored, and
+    contradicts one already stored,
+    :class:`risk_scoring.state.PatientEventLimitError` when storing it
+    would take its patient past ``config.max_events_per_patient``, and
     :class:`risk_scoring.serving.UnknownPatientError` when a discharge
     arrives before its patient's demographics. Neither refusal stores the
     event.
@@ -102,12 +108,18 @@ def ingest_event(
             serving.require_demographics(
                 state.has_patient(conn, event.patient), event.id, event.patient
             )
-        stored = state.record_event(conn, event)
+        stored = state.record_event(conn, event, max_patient_rows=config.max_events_per_patient)
         if not isinstance(event, state.EncounterEvent):
             return IngestResult(stored, *_NOT_SCORED)
         if predictions.has_prediction(conn, event.id):
             return IngestResult(stored, *_NOT_SCORED)
-        history = state.patient_history(conn, event.patient)
+
+        window = serving.history_window(event)
+        if window is None:
+            # Still open: no discharge instant to read history against, and
+            # serving_features would say the same of the same row.
+            return IngestResult(stored, *_NOT_SCORED)
+        history = state.patient_history(conn, event.patient, window)
 
     scoring_input = serving.serving_features(history, event.id)
     if scoring_input is None:
