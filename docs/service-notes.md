@@ -29,7 +29,7 @@ python -m risk_scoring.db migrate
 docker compose up -d postgres
 ```
 
-The image is pinned to `postgres:17.6-alpine`, digest `sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94`; bump the tag and the digest together. Data persists in the named volume `postgres-data`. Credentials come from the environment with committed development defaults (`risk`/`risk`, database `risk_scoring`), overridable via a local `.env` file that stays out of git. The container publishes on `127.0.0.1:5433`, so only processes on the machine can reach it and the development defaults never face a network; the port is 5433, not 5432, so a Postgres already installed on the machine never collides with it. The healthcheck runs `pg_isready`, which is what later Compose services wait on before starting.
+The image is pinned to `postgres:17.6-alpine` by tag and digest `sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94` in both `docker-compose.yml` and the CI workflow, so a re-tagged upstream image cannot change what the stack runs. The digest is the multi-arch index rather than one platform's manifest; `docker buildx imagetools inspect postgres:17.6-alpine` prints it. Bump the tag and the digest together, in both files. Data persists in the named volume `postgres-data`. Credentials come from the environment with committed development defaults (`risk`/`risk`, database `risk_scoring`), overridable via a local `.env` file that stays out of git. The container publishes on `127.0.0.1:5433`, so only processes on the machine can reach it and the development defaults never face a network; the port is 5433, not 5432, so a Postgres already installed on the machine never collides with it. The healthcheck runs `pg_isready`, which is what later Compose services wait on before starting.
 
 ## Database tests
 
@@ -215,7 +215,7 @@ Schema changes are a separate one-shot service rather than part of the service's
 
 Host port 8001, not 8000, for the same reason Postgres publishes on 5433: an application already listening on the usual port must never collide with the stack.
 
-The image is `python:3.12-slim` with dependencies installed from the same `uv.lock` CI installs, so the container runs the versions the tests ran against. LightGBM's wheel links against `libgomp`, which the slim base omits, so the image installs it. The service's own source is copied in; the registry, `configs/`, and the working directory arrive by mount.
+The image is `python:3.12-slim` with dependencies installed from the same `uv.lock` CI installs, so the container runs the versions the tests ran against. The Dockerfile pins both of its base images by digest as well as tag, each digest being the multi-arch index: `python:3.12-slim` at `sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea` and the `uv` binary's source image `ghcr.io/astral-sh/uv:0.9.7` at `sha256:ba4857bf2a068e9bc0e64eed8563b065908a4cd6bfb66b531a9c424c8e25e142`. Bump a tag and its digest together. LightGBM's wheel links against `libgomp`, which the slim base omits, so the image installs it. The service's own source is copied in; the registry, `configs/`, and the working directory arrive by mount.
 
 Two things the container forced into the service code:
 

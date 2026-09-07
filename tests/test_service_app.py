@@ -162,6 +162,21 @@ def test_resolve_git_sha_in_repo_and_outside(tmp_path: Path) -> None:
     assert resolve_git_sha(bare) is None
 
 
+def test_resolve_git_sha_reports_unknown_when_git_is_not_installed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No git on the machine means no SHA, even inside a repository."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    commit = ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty"]
+    subprocess.run([*commit, "-q", "-m", "x"], cwd=repo, check=True)
+    monkeypatch.delenv("RISK_SCORING_GIT_SHA", raising=False)
+    monkeypatch.setattr("shutil.which", lambda cmd, *args, **kwargs: None)
+
+    assert resolve_git_sha(repo) is None
+
+
 # --- ingestion endpoint ---
 
 

@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -70,13 +71,19 @@ def resolve_git_sha(repo_root: Path) -> str | None:
     ``RISK_SCORING_GIT_SHA`` and ``/version`` stays honest in a container.
     An unset build argument arrives as an empty string, which is not a SHA,
     so it falls through to the working tree the same as no variable at all.
+    The fallback runs git by absolute path, looked up once, so the
+    subprocess never depends on PATH at the moment it starts; no git on
+    the machine reads as no SHA.
     """
     stamped = os.environ.get(ENV_GIT_SHA, "").strip()
     if stamped:
         return stamped
+    git = shutil.which("git")
+    if git is None:
+        return None
     try:
         proc = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
+            [os.path.abspath(git), "rev-parse", "HEAD"],
             cwd=repo_root,
             capture_output=True,
             text=True,
