@@ -229,7 +229,25 @@ name = "readmission-risk"
 version = 3
 ```
 
-The pin must be an explicit positive integer. The loader rejects strings (including `"latest"` and numeric strings), booleans, zero, and negatives, and no code path in the service resolves "newest", so serving an unpinned model is structurally impossible. This deliberately differs from the gate, which defaults to the newest registered version when no pin is given: a gate wants the latest candidate, a service wants exactly what was promoted. A missing pin or an absent version stops startup with an error naming the model, the version, and the registry URI. The committed pin is version 4, the version the last full retrain from raw data produced, and a test asserts the committed name matches `risk_scoring.train.MODEL_NAME` so the two cannot drift. Nothing yet compares the pinned version's logged feature version to the `FEATURE_VERSION` the service computes with; `GET /version` reports both and draws no conclusion. That gap is filed as an issue, not closed here.
+The pin must be an explicit positive integer. The loader rejects strings (including `"latest"` and numeric strings), booleans, zero, and negatives, and no code path in the service resolves "newest", so serving an unpinned model is structurally impossible. This deliberately differs from the gate, which defaults to the newest registered version when no pin is given: a gate wants the latest candidate, a service wants exactly what was promoted. A missing pin or an absent version stops startup with an error naming the model, the version, and the registry URI. The committed pin is version 4, the version the last full retrain from raw data produced, and a test asserts the committed name matches `risk_scoring.train.MODEL_NAME` so the two cannot drift.
+
+## Refusing a model this code did not fit
+
+Startup also refuses a pinned model whose training run recorded different feature or cohort versions than the running process computes with. Training logs `feature_version` and `cohort_version` as run parameters, so the pinned version's own run says what it was fitted under, and `risk_scoring.service.compatibility` compares that against the constants this process will use. The check runs after the model loads and before anything is written to the app state; it holds nothing, so the structural test naming exactly what the lifespan stores is untouched by it.
+
+The gap this closes was real rather than hypothetical. Versions 1 through 3 were trained at `FEATURE_VERSION` 1.0.0, the prior-encounter predicate became strict, the version moved to 1.1.0, and the service went on scoring. `GET /version` reported both numbers side by side and drew no conclusion from them, so the disagreement was found by reading code. Every prediction logged in that window carries a model version and a feature version that do not belong together.
+
+Three decisions worth recording.
+
+The comparison is on the major and minor numbers, not the full string. `features.py` defines its patch number as moving when parsing or validation changes and no value does, and its minor number as the case where a model trained under the previous number no longer matches serving. Comparing full strings would make a parsing fix a production event and would put pressure on nobody ever bumping the patch number. The looser rule is the one the module already states.
+
+The check covers feature and cohort versions and not the label version. Both of the first two execute at serving, and a cohort change means the model was fitted against a different population definition. Labels only build training targets and never run at serving. `SERVING_VERSIONS` states the covered set in one place, and a test restates it literally, so a version added to training later has to be decided on rather than quietly omitted.
+
+A run that logged no such version at all is a refusal, not a pass, and so is a version string the check cannot parse. Both mean the same thing: the service cannot show that the model matches its code, and fail-closed is what the rest of startup already does.
+
+The cost is real and worth stating. After a minor feature or cohort bump the stack will not come up until a model trained at the new version is registered and pinned. That is the point of the check, and it means a feature change is now a two-step operation. There is no override flag; adding one would give the check an escape hatch whose only use is defeating it.
+
+Confirmed against the real containers on 2026-09-08, using the registry as it stands rather than a fixture. Version 3 is a genuine `FEATURE_VERSION` 1.0.0 model, so pinning it and running `docker compose up` exercised the negative case directly: the app container exited 3 with `model 'readmission-risk' version 3 was not fitted under this service's code: it was trained at feature version 1.0.0, against this service's 1.1.0`. Restoring the pin to 4 brought the stack up healthy with `GET /version` answering as before.
 
 ## How the container reaches the registry
 
