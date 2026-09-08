@@ -5,6 +5,9 @@ The rules these tests pin:
 - Startup loads the pinned model version from the MLflow registry and
   opens the connection pool, and fails loudly, at startup rather than as
   a later 500, when either the pinned version or the database is absent.
+- Startup also refuses a pinned model whose training run recorded
+  different feature or cohort versions than this code computes with,
+  comparing the major and minor numbers so a patch bump still starts.
 - /health answers ok only once the lifespan has run, so a 200 implies
   the model loaded and the database is reachable.
 - /version reports the full provenance set: model name and pinned
@@ -47,6 +50,7 @@ from risk_scoring import train
 from risk_scoring.cohort import COHORT_VERSION
 from risk_scoring.features import FEATURE_VERSION
 from risk_scoring.payload_hash import payload_hash
+from risk_scoring.service import compatibility
 from risk_scoring.service.app import MAX_EVENT_BYTES, create_app, resolve_git_sha
 from risk_scoring.service.auth import ENV_API_TOKEN, bearer_headers
 from risk_scoring.service.config import ServiceConfig
@@ -143,6 +147,65 @@ def test_startup_fails_loudly_when_database_unreachable(
     unreachable = "postgresql://risk:risk@127.0.0.1:1/risk_scoring"
     app = create_app(ServiceConfig(MODEL_NAME, trained.model_version), root, unreachable)
     with pytest.raises(RuntimeError, match="database"), TestClient(app):
+        pass
+
+
+def _serving_versions(monkeypatch: pytest.MonkeyPatch, **overrides: str) -> None:
+    """Pretend this process computes with the given versions."""
+    monkeypatch.setattr(
+        compatibility, "SERVING_VERSIONS", {**compatibility.SERVING_VERSIONS, **overrides}
+    )
+
+
+@pytest.mark.parametrize(
+    ("signal", "value"),
+    [("feature_version", "2.0.0"), ("cohort_version", "1.4.0")],
+)
+def test_startup_refuses_a_model_not_fitted_under_this_code(
+    trained_repo: tuple[Path, train.TrainingResult],
+    db_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+    signal: str,
+    value: str,
+) -> None:
+    """The failure that prompted this check: the pin and the code drift apart.
+
+    The fixture model is trained by the real pipeline, so it always logs
+    the current versions; moving the code's side is what makes the pair
+    disagree.
+    """
+    root, trained = trained_repo
+    _serving_versions(monkeypatch, **{signal: value})
+    app = create_app(ServiceConfig(MODEL_NAME, trained.model_version), root, db_url)
+    with pytest.raises(RuntimeError, match=value), TestClient(app):
+        pass
+
+
+def test_startup_accepts_a_patch_level_difference(
+    trained_repo: tuple[Path, train.TrainingResult],
+    db_url: str,
+    api_token: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A patch bump is defined as moving no value, so it needs no retrain."""
+    root, trained = trained_repo
+    major, minor, _ = FEATURE_VERSION.split(".")
+    _serving_versions(monkeypatch, feature_version=f"{major}.{minor}.99")
+    app = create_app(ServiceConfig(MODEL_NAME, trained.model_version), root, db_url)
+    with TestClient(app, headers=bearer_headers(api_token)) as started:
+        assert started.get("/health").status_code == 200
+
+
+def test_startup_refuses_a_model_whose_run_logged_no_such_version(
+    trained_repo: tuple[Path, train.TrainingResult],
+    db_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A model registered before a version was logged cannot be vouched for."""
+    root, trained = trained_repo
+    _serving_versions(monkeypatch, scoring_version="1.0.0")
+    app = create_app(ServiceConfig(MODEL_NAME, trained.model_version), root, db_url)
+    with pytest.raises(RuntimeError, match="logged no scoring version"), TestClient(app):
         pass
 
 

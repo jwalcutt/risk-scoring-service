@@ -70,6 +70,7 @@ from risk_scoring.db import database_url
 from risk_scoring.features import FEATURE_VERSION
 from risk_scoring.payload_hash import payload_hash
 from risk_scoring.service.auth import ENV_API_TOKEN, authorized, require_api_token
+from risk_scoring.service.compatibility import verify_pinned_versions
 from risk_scoring.service.config import ServiceConfig
 from risk_scoring.service.events import Event, to_state_event
 from risk_scoring.service.ingest import IngestResult, ingest_event
@@ -215,6 +216,7 @@ def create_app(config: ServiceConfig, repo_root: Path, dsn: str | None = None) -
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         api_token = require_api_token()
         model = _load_model(config, repo_root)
+        verify_pinned_versions(config, repo_root)
         pool = _open_pool(dsn, config.pool_size)
         app.state.api_token = api_token
         app.state.model = model
