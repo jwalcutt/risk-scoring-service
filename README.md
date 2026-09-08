@@ -36,6 +36,14 @@ Trained models are versioned in MLflow, backed by a SQLite database at the repos
 python -m risk_scoring.tracking ui
 ```
 
+The store carries its own schema version. When an MLflow upgrade moves that schema, every command that opens the registry refuses until the existing database is migrated on the host, and the service container cannot do it because the database is mounted read-only:
+
+```bash
+mlflow db upgrade "sqlite:///$PWD/mlflow.db"
+```
+
+Rebuild the service image afterwards so the version inside the container matches the migrated store. A fresh clone has no `mlflow.db` and needs neither step.
+
 ## Cohort and features
 
 Scoring targets adult inpatient discharges. The cohort module (`risk_scoring.cohort`) selects them from raw generator output, excluding in-hospital deaths and patients under 18 at discharge, and reports exclusion counts for every run alongside its `COHORT_VERSION`.
