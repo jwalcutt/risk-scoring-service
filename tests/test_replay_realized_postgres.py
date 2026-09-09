@@ -8,6 +8,11 @@ scores are identical by the skew check and the labels by the label
 proof, so the metrics must be identical too; a tolerance would hide a
 join bug. The window is half-open on the discharge instant, and a
 discharge without a label is not in it.
+
+The ``released_by`` bound is pinned here too. It is what lets a monitoring
+evaluation be a pure function of its boundary: a window read at the
+boundary and the same window read after the run finished must agree, which
+they only do if labels released after the boundary are excluded.
 """
 
 from __future__ import annotations
@@ -80,9 +85,23 @@ def replayed(
     return db_url
 
 
-def _realized(dsn: str, start: datetime, end: datetime) -> RealizedPerformance:
+def _realized(
+    dsn: str, start: datetime, end: datetime, *, released_by: datetime | None = None
+) -> RealizedPerformance:
     with psycopg.connect(dsn, connect_timeout=2) as conn:
-        return realized_performance(conn, start, end)
+        return realized_performance(conn, start, end, released_by=released_by)
+
+
+def _release_instants(dsn: str) -> list[datetime]:
+    """Every label's release instant in the order the labels were written."""
+    with psycopg.connect(dsn, connect_timeout=2) as conn:
+        return [
+            row[0]
+            for row in conn.execute(
+                "SELECT l.released_at FROM labels AS l"
+                " JOIN predictions AS p USING (prediction_id) ORDER BY l.released_at, l.label_id"
+            ).fetchall()
+        ]
 
 
 def test_the_join_reconstructs_the_batch_pipelines_metrics_exactly(
@@ -129,3 +148,35 @@ def test_an_empty_window_has_no_metrics(replayed: str) -> None:
 def test_the_window_bounds_must_be_ordered(replayed: str) -> None:
     with pytest.raises(ValueError, match="before"):
         _realized(replayed, END, START)
+
+
+# --- the released_by bound ---
+
+
+def test_a_released_by_bound_at_the_end_of_the_run_changes_nothing(replayed: str) -> None:
+    """Every label in the run was released before it ended, so the bound is a no-op."""
+    assert _realized(replayed, START, LABELLED_END, released_by=END) == _realized(
+        replayed, START, LABELLED_END
+    )
+
+
+def test_a_released_by_bound_before_every_release_empties_the_window(replayed: str) -> None:
+    assert _realized(replayed, START, LABELLED_END, released_by=START) == RealizedPerformance(
+        count=0, prevalence=None, auroc=None
+    )
+
+
+def test_a_released_by_bound_excludes_a_label_released_after_it(replayed: str) -> None:
+    """The count grows by one as the bound crosses each release instant."""
+    instants = _release_instants(replayed)
+    assert len(instants) == 5
+    for expected, instant in enumerate(instants, start=1):
+        assert _realized(replayed, START, LABELLED_END, released_by=instant).count == expected
+        before = instant - timedelta(seconds=1)
+        assert _realized(replayed, START, LABELLED_END, released_by=before).count == expected - 1
+
+
+def test_the_released_by_bound_is_inclusive_of_its_own_instant(replayed: str) -> None:
+    """A label released exactly at a boundary was available at that boundary."""
+    first = _release_instants(replayed)[0]
+    assert _realized(replayed, START, LABELLED_END, released_by=first).count == 1

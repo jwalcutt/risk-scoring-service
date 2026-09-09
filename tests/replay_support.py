@@ -137,12 +137,13 @@ def prepare(
     *,
     start: datetime = START,
     end: datetime = END,
+    population: str = POPULATION,
 ) -> runs.ReplayRun:
     """Preload history and open the run row, as the start command does."""
     with psycopg.connect(dsn, connect_timeout=2) as conn:
         preload.preload_history(conn, frames, events, clock.instant(start))
         return runs.create_run(
-            conn, population=POPULATION, start_at=start, end_at=end, acceleration=4
+            conn, population=population, start_at=start, end_at=end, acceleration=4
         )
 
 
