@@ -11,7 +11,8 @@ The rules these tests pin:
 - Subgroups are report-only: small or single-class subgroups have their
   metrics suppressed with a note, and never move the verdict.
 - Subgroup membership covers four age bands, both sexes (joined from the
-  patients frame), and the seven comorbidity flags.
+  patients frame), and the comorbidity flags, which the gate derives from
+  the feature pipeline instead of restating.
 - The rendered report carries the verdict, every check, the headline
   metrics with confidence intervals, and the subgroup table.
 """
@@ -32,7 +33,12 @@ from mlflow import MlflowClient
 from factories import write_gate_population, write_leak_population, write_training_csvs
 from risk_scoring import gate, train
 from risk_scoring.cohort import build_cohort
-from risk_scoring.features import FEATURE_COLUMNS, build_features
+from risk_scoring.features import (
+    FEATURE_COLUMNS,
+    FLAG_CODES,
+    MODEL_INPUT_COLUMNS,
+    build_features,
+)
 from risk_scoring.labels import build_labels
 
 # --- deterministic fixtures ---
@@ -164,6 +170,19 @@ def test_single_class_subgroup_is_suppressed() -> None:
     (subgroup,) = result.subgroups
     assert subgroup.auroc is None
     assert "single" in subgroup.note
+
+
+def test_flag_columns_track_the_feature_pipeline() -> None:
+    """An eighth flag added to FLAG_CODES must reach the subgroup report.
+
+    The gate reported flags from its own hand-written tuple, so a flag
+    added to the feature pipeline became a model input the subgroup
+    report never covered. Deriving the tuple closes that gap; this test
+    pins the derivation and the column names it produces.
+    """
+    assert tuple(FLAG_CODES) == gate.FLAG_COLUMNS
+    for flag in gate.FLAG_COLUMNS:
+        assert flag in MODEL_INPUT_COLUMNS
 
 
 def test_build_subgroups_produces_age_sex_and_flag_columns() -> None:
