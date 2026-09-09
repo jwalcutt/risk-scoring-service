@@ -1,0 +1,53 @@
+# Monitoring configuration: the evaluation grid, the minimum a window needs
+# before it may claim anything, and the threshold each signal is judged
+# against. Committed so that what the monitor decided is reproducible from
+# the repository alone, and so that a changed threshold is a visible diff.
+# The digest of this file is stored on every evaluation row.
+#
+# EVERY NUMBER BELOW IS A PLACEHOLDER. The thresholds are set from the
+# measured distribution of each statistic over a clean twelve-month replay
+# and from the multiple-comparison arithmetic over fifteen signals, then
+# frozen and dated. Until that happens these values are here to make the
+# code path real, not to be believed.
+
+[monitoring]
+# Boundaries sit at the run's start plus 7k days. Seven days is short
+# enough to place a detection within a week of simulated time and long
+# enough that consecutive windows are not mostly the same discharges.
+cadence_days = 7
+# Each boundary looks back 30 days, clipped at the run's start. Thirty is
+# the label maturation window, so a window's discharges and the labels
+# maturing over it are on the same scale.
+window_days = 30
+# Below this many predictions a window reports no drift statistic at all.
+# Twenty against a reference of roughly 11,000 is where a KS test stops
+# being a coin flip; the clean replay confirms or moves it.
+minimum_predictions = 20
+# Discharges a full 30-day window is expected to hold, scaled by length
+# for the short windows at the start of a run. Measured, not derived: the
+# reference row stores no window span, so this is the one number about the
+# replayed population that the config has to carry.
+expected_discharges_per_30_days = 50
+
+[thresholds]
+# One p-value floor covers all fifteen drift tests. Fifteen signals over
+# fifty-two windows is 780 tests, so the floor has to account for that
+# arithmetic rather than read like a single hypothesis test.
+drift_p_floor = 0.001
+# Volume alerts when the window holds less than this fraction of what its
+# length implies. An outage and a refused event kind both land here.
+volume_floor_fraction = 0.5
+# Refusals above this count in a window alert. A clean stream produces
+# none, so zero is the floor a clean run should hold.
+refusal_ceiling = 0
+# Predictions in the window from a model or feature version other than the
+# reference's. Zero during a single-model run; a shadow deployment will
+# need this raised, deliberately and in its own commit.
+version_mismatch_ceiling = 0
+
+# A single drift signal's floor can be raised here without restating the
+# other fourteen. Every key must name a signal that carries a p-value, or
+# the load fails.
+#
+# [thresholds.signal_overrides]
+# los_days = 0.0001
