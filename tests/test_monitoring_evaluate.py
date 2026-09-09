@@ -18,6 +18,7 @@ The rules these tests pin:
 
 from __future__ import annotations
 
+import dataclasses
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -256,7 +257,7 @@ def test_a_reference_missing_a_signal_is_refused() -> None:
     features, scores = _window(60)
     with pytest.raises(ValueError, match="los_days"):
         compare(
-            Reference(**{**reference.__dict__, "features": trimmed}),
+            dataclasses.replace(reference, features=trimmed),
             features,
             scores,
             minimum_predictions=20,

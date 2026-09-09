@@ -23,6 +23,18 @@ through to what is derived from them.
 The file also reads the substantive numbers once against live data rather
 than only comparing them to each other, since three equal wrong answers
 would satisfy the arms above.
+
+One thing this file cannot say anything about, and it matters: the
+false-alarm rate. The reference here is the training window of the fixture
+model, which was fitted on a different synthetic population from the one
+replayed, so the two distributions genuinely differ and almost every
+window alerts. That is the statistics working, not the thresholds failing.
+Whether the placeholder thresholds are sensible is measured over a clean
+replay where the reference and the replayed data come from one frozen
+population. What is asserted here instead is that the comparison
+discriminates: some signals are flagged and others are not, and the
+matched case is pinned in the pure tests, where an identical window scores
+zero and raises nothing.
 """
 
 from __future__ import annotations
@@ -421,7 +433,31 @@ def test_a_paused_and_resumed_replay_evaluates_identically(
     ) == _volatile_free(expected)
 
 
-def test_the_alerts_a_run_raises_are_the_same_in_every_arm(
+def test_the_comparison_discriminates_between_signals(
+    straight: tuple[str, int], built_reference: Reference, config: MonitoringConfig
+) -> None:
+    """A statistic that flagged everything would pass every other test in this file.
+
+    The replayed population differs from the reference's on the columns the
+    two factories build differently, and agrees on the ones they build the
+    same way, so a full window must flag some signals and not others.
+    """
+    dsn, reference_id = straight
+    full = next(
+        e
+        for e in _evaluate_all(dsn, built_reference, reference_id, config)
+        if e.statistics.minimum_met
+    )
+    flagged = {alert.signal for alert in judge(full, config)}
+    assert flagged
+    quiet = set(signals.DRIFT_SIGNALS) - flagged
+    assert quiet, "every drift signal alerted, so the comparison is not discriminating"
+    for signal in quiet:
+        p_value = full.p_value_for(signal)
+        assert p_value is not None and p_value >= config.thresholds.p_floor_for(signal)
+
+
+def test_judging_the_same_evaluation_twice_gives_the_same_alerts(
     straight: tuple[str, int], built_reference: Reference, config: MonitoringConfig
 ) -> None:
     """Judging is pure, so equal evaluations must give equal alerts."""
@@ -430,6 +466,15 @@ def test_the_alerts_a_run_raises_are_the_same_in_every_arm(
     once = [judge(evaluation, config) for evaluation in evaluations]
     again = [judge(evaluation, config) for evaluation in evaluations]
     assert once == again
+
+
+def test_an_alert_names_its_own_evaluation_boundary(
+    straight: tuple[str, int], built_reference: Reference, config: MonitoringConfig
+) -> None:
+    """What the alerts table's composite foreign key will then make unfalsifiable."""
+    dsn, reference_id = straight
+    for evaluation in _evaluate_all(dsn, built_reference, reference_id, config):
+        assert all(alert.sim_at == evaluation.boundary for alert in judge(evaluation, config))
 
 
 def _volatile_free(evaluations: list[Evaluation]) -> list[dict[str, object]]:

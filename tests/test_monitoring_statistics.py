@@ -158,7 +158,7 @@ def test_ks_sees_a_shift_in_the_discharge_gap_cap_mass() -> None:
 
 
 def test_ks_over_five_rows_against_twelve_thousand_claims_nothing() -> None:
-    """The substep's sparse case: a real statistic, no significance, no exception."""
+    """The sparse case that matters: a real statistic, no significance, no exception."""
     reference = np.arange(12000.0)
     result = st.ks_two_sample(reference, reference[::2400])
     assert result.n_window == 5
