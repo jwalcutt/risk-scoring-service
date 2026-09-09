@@ -58,6 +58,261 @@ Migration `0007_monitoring.sql` adds three.
 
 `sim_at` is the instant the detection-time measurement reads, so it must be the boundary and not a wall-clock read. That is enforced by the schema rather than by the writer: `monitoring_evaluations` carries `UNIQUE (evaluation_id, boundary)` purely as a foreign-key target, and `alerts` references that pair, so an alert whose instant is not its own evaluation's boundary cannot be written at all. It is the same move the labels table makes with `released_at >= due_at`, where a rule that matters is a property of the table instead of a convention in the code. `UNIQUE (evaluation_id, signal)` says the rest: at one boundary a signal either alerts or it does not.
 
+## The signals and their statistics
+
+Nineteen signals, derived from the feature pipeline's own columns rather
+than listed again, so a column added there cannot leave a signal unnamed.
+Seven feature columns hold a continuous or count value and are compared by
+a two-sample Kolmogorov-Smirnov test. Seven are binary comorbidity flags
+and are compared by a pooled two-proportion test. The score is compared by
+the same KS test as a continuous feature, which makes fifteen signals
+carrying a p-value: the number the multiple-comparison arithmetic has to
+account for at the freeze. Three more are counts rather than distributions,
+namely prediction volume, refused events, and predictions from a model or
+feature version other than the reference's. The nineteenth is population
+stability index on the score, which is reported and never judged: it has no
+p-value, and its conventional 0.1 and 0.25 bands are folklore rather than a
+test.
+
+The arithmetic is in `risk_scoring.monitoring.statistics`, and the module's
+own docstring carries the judgment calls. Three are worth repeating here
+because they were nearly got wrong.
+
+The KS statistic is the largest gap between two right-continuous
+distribution functions evaluated over the merged sample's distinct values.
+The familiar shortcut, a running sum of steps over the concatenated sort,
+is exact only when the two samples share no values. Both samples here are
+heavily tied: five of the seven columns are small integers, and
+`days_since_prev_discharge` has a mass point at 365.0 that means both
+"capped" and "no prior discharge". For a reference of `[0, 0, 1, 1]`
+against a window of `[0, 1]` the true gap is zero and the running sum
+wanders to a half inside the tied block, and which half depends on the
+sort's tie order, so the shortcut is not even a function of the two
+samples. The cap itself costs no power, which is worth stating because it
+looks as though it should: both distribution functions reach one at 365.0,
+so a change in the no-prior-discharge rate is detected at the largest value
+below the cap, where the gap equals the difference in cap mass exactly.
+
+The two-sided normal tail goes through `math.erfc` rather than
+`1 - normal_cdf`. The naive form returns exactly zero past about eight
+standard errors, which is reachable: a flag going from absent to universal
+in a twenty-row window against a hundred-row reference gives a z near
+eleven. Against a real eleven-thousand-row reference the tail underflows to
+exactly zero anyway, at a z near 106. That is recorded rather than clamped.
+A floor invented to keep a logarithmic axis readable would be a number
+nobody measured, and a p-value of zero still judges correctly.
+
+PSI bins are the reference's own quantiles, deduplicated exactly. A tree
+ensemble's leaf values repeat, so a collapsed bin is the ordinary case and
+the realized bin count is stored: a sum over seven bins is not comparable
+to one over ten. The epsilon substituted for an empty bin is applied to
+both sides, not only to the window, because a reference bin can be empty
+even after deduplication when an interpolated quantile edge brackets no
+reference row, and a one-sided epsilon then takes the logarithm of a ratio
+with zero underneath. With both sides floored every ratio lies between the
+epsilon and its reciprocal, so the sum is finite as a property of the rule
+rather than by luck. The value 1e-4 is the largest conventional choice that
+still sits far below the smallest mass a sixty-row window can express,
+1/60, so a bin holding one real observation can never read as empty.
+
+One caveat that has to travel with every stored p-value. Because the
+effective sample size is the harmonic combination of the two, it never
+exceeds the window's own: 11,294 reference rows against a sixty-row window
+give 59.68, half a percent better than an infinite reference. The window
+alone sets the resolution, and at sixty rows the smallest gap the KS test
+can flag at the asymptotic five percent point is 0.176 of the distribution.
+Two further biases both push toward under-alerting: the asymptotic series
+is roughly ten to fifteen percent too generous near p = 0.05 at these
+sizes, and ties shrink the gap achievable under the null, which also gives
+the sparse count columns a p-value with a handful of atoms rather than a
+smooth null. So the p-value is a monotone drift score, not a calibrated
+false-alarm rate, and it is not exchangeable across columns with different
+tie structure. The thresholds come from the measured distribution over a
+clean run for exactly that reason. If that distribution turns out unusable,
+the dependency-free fix is a fixed-seed permutation p-value, which is exact
+under ties and stays deterministic. It is named here and not built.
+
+The two-proportion test has a matching weakness in the other direction. Its
+normal approximation wants the pooled count at five or more, which at a
+sixty-row window needs a rate above eight percent, and several comorbidity
+flags are rarer than that. So the flag test sits outside its validity range
+exactly where a case-mix shift would show. It is computed anyway and all
+four counts are stored beside it, so a reader can apply the rule; declining
+to report a rare flag is policy and does not belong in the arithmetic.
+Fisher's exact test would remove the weakness through `math.lgamma` with no
+new dependency, and is the named alternative rather than a silent
+substitution for what was decided.
+
+## What a short window may say
+
+Decided here, and left open when the grid was fixed. Below the minimum
+prediction count every drift statistic is `None`, the score's PSI with
+them, and only volume, refusals, and version mismatches can raise an
+alert. Twenty is the recommended count and a placeholder like every other
+number in `configs/monitoring.toml`.
+
+Two details of how that is expressed. The signal keys stay present with
+`None` statistics rather than being left out, so a sparse window leaves a
+gap in a dashboard series instead of removing the series, and the counts on
+each suppressed result still say how sparse the window was. And the count
+signals are deliberately unaffected by the rule, because an outage is
+precisely the window too thin to compute drift on: a monitor that went
+quiet exactly when the stream stopped would be useless.
+
+The alternative was to skip judging a sparse window entirely. Suppressing
+the statistics instead means `judge` has one rule for a missing number, and
+the same rule covers a window where a statistic is uncomputable for its own
+reasons, such as a flag that is absent from both samples.
+
+## Alert rules as data
+
+`configs/monitoring.toml` carries the cadence, the window, the minimum
+count, the expected discharge rate, and one threshold per kind of signal.
+Its digest is stored on every evaluation row, so a changed threshold shows
+up in the data and not only in a commit.
+
+One p-value floor covers all fifteen drift tests rather than fifteen floors
+being written out. The arithmetic the freeze does is one calculation over
+fifteen signals and fifty-two windows, not fifteen separate ones, and an
+optional `signal_overrides` table is where a single signal's floor can be
+raised later without restating the other fourteen.
+
+That table is the one place a config in this repository refuses a key it
+does not recognize. Every other loader ignores an unknown key. This one
+cannot: these values become the evidence that the thresholds were fixed
+before any failure was injected, and a misspelled threshold key that
+silently took the shared default would make that evidence say something
+untrue. Only signals carrying a p-value may be overridden, since volume and
+the two counts are judged on counts and a p-value floor for them would
+parse and mean nothing. Nothing in the file has a default, either: a
+threshold nobody wrote down is not a threshold.
+
+The expected discharge rate is a departure worth naming. The plan called
+for comparing volume against the reference's own discharges-per-30-days,
+but `monitoring_reference` stores no window span, only the training cutoff,
+so that rate is not computable from the stored row. The alternative was a
+migration adding span columns and a rebuilt reference row, which reopens a
+table committed alongside the reference itself, for a number the clean
+replay measures anyway. Rejected as well was the median of earlier windows,
+which is blind to a slow decline and says nothing at the first boundary. So
+the rate is a configured value, scaled by the window's actual length so the
+short windows at the start of a run are compared fairly rather than reading
+as an outage every time.
+
+`judge` is pure and does nothing but compare. A statistic exactly at its
+threshold does not alert and one past it does, which is the case an
+operator will argue about, so it is pinned in a test rather than left to a
+comparison operator nobody reread. A `None` statistic never alerts. And
+`judge` refuses a config whose digest is not the one the evaluation was
+computed under, because an evaluation row names its rules and judging it
+against different rules would produce alerts the row cannot account for.
+
+## What an evaluation reads
+
+Two readings had to be settled before the queries made sense.
+
+`prediction_count` is the window's, while `label_count` counts the labels
+released inside the window. They answer different questions: how much the
+service scored lately, and how much ground truth arrived lately. A label
+pipeline that stalls shows in the second and not the first.
+
+Realized performance is cumulative over the run to the boundary, not over
+the drift window. Labels mature thirty simulated days after discharge and
+the drift window is the last thirty days, so a realized metric over that
+window would be empty at every boundary by construction. Cumulative with a
+`released_by` bound is both non-empty and reproducible, and it is the
+series a reader wants as labels mature. That bound is a new keyword on
+`replay.realized_performance` rather than a second join written in the
+monitoring code, because the rules about what an empty or single-class
+window may report have to hold identically either way. Without it the same
+window read after the run would pick up labels that had not been released
+when the boundary passed, and a run evaluated live would disagree with the
+same run evaluated afterwards.
+
+Realized metrics stay report-only in this phase. At around fifty labelled
+discharges and eight positives a window AUROC has a confidence interval too
+wide to alert on. The freeze decides whether that stays true.
+
+A boundary handed to the evaluator must lie on the grid. An arbitrary
+instant would produce a perfectly valid-looking row that no second
+evaluation could reproduce, and the unique index on `(run_id, boundary)`
+would then be guarding a set nobody had defined. A run whose length is not
+a whole number of cadences leaves its last few days unevaluated, which is
+what a fixed grid does; stretching the final window to reach the end would
+make one window a different size from the other fifty-one and quietly
+change what its statistics mean.
+
+Feature versions are compared by major and minor, reusing
+`service.compatibility.major_minor`, because the feature module defines a
+patch bump as moving no value. A version string this code cannot parse
+counts as a mismatch, matching how the startup guard treats the same case.
+
+Refusals are counted by a function that returns zero, because nothing
+records a refusal yet: the harness stops on one. The signal has a column, a
+threshold, and that seam now, so recording refusals changes one function
+and no schema, and a test pins the zero so that change cannot be forgotten.
+
+## Determinism against a replay, 2026-09-08
+
+`tests/test_monitoring_evaluate_postgres.py` replays 162 cohort discharges
+of a purpose-built population over ninety simulated days, 2025-01-01 to
+2025-04-01, in three databases: straight through; paused at each of the
+twelve boundaries and evaluated there before resuming; and paused and
+resumed at an instant deliberately off the grid. All three produce equal
+evaluations apart from the reference id the database assigned, and the
+prediction and label tables are equal too. The first comparison is the
+purity property, that how far past a boundary the harness had run cannot
+change what the boundary says. The second carries the byte-identity
+guarantee from the two tables through to what is derived from them.
+
+The population is new because the existing ones do not suit a boundary
+grid. The skew population scores single digits over four simulated months.
+The gate population lives in 2022 and 2023 with a fourteen-month hole
+between its two encounter clusters, sits entirely inside the training
+window, and is what the fixture model is fitted on. One index inpatient
+stay every sixteen hours from the training cutoff gives the density the
+grid needs, and comorbidity codes are drawn from the feature module's own
+lists by sorted order rather than by iterating a frozenset, because string
+hashing is randomized between processes and the export has to be identical
+every time.
+
+Twelve boundaries, 2,160 ticks, 557 stream events posted, 99 labels
+released, 5.8 seconds at max speed. The window counts are 5, 15, 27, 40,
+then 50 to 57 for the rest, so the first two boundaries fall below the
+minimum count and report nothing while the remaining ten report real
+statistics. That is the point of the sizing: one run exercises both sides
+of the rule. Cumulative realized count climbs from 0 to 90 and the realized
+AUROC appears at the sixth boundary once both classes have matured, running
+0.5000, 0.5562, 0.7263, 0.7143, 0.6886, 0.6434, 0.6623.
+
+The worked evaluation at 2025-02-26, window 2025-01-27 to 2025-02-26: 57
+predictions against 50.0 expected, 35 labels released in the window, 0
+refusals, 0 version mismatches, realized count 36 at prevalence 0.2500 and
+AUROC 0.7263. Its p-values are 0.03227 for `age_at_discharge`, 7.6e-10 for
+`los_days`, 1 for `prior_inpatient_180d` and `days_since_prev_discharge`,
+7.3e-06 for `prior_ed_180d`, 2.2e-49 for `active_medication_count`,
+5.3e-27 for `active_disorder_count`, between 1e-98 and 1e-137 for the seven
+flags, and 0.00054 for `score`; PSI 0.7382 over 10 bins. The whole payload
+is twenty keys and 5.3 kB of JSON.
+
+One finding that has to travel with those numbers: **this run says nothing
+about the false-alarm rate.** Eleven of its twelve windows alert, on ten to
+twelve signals each. That is the statistics working, not the thresholds
+failing. The reference is the training window of the fixture model, which
+was fitted on a different synthetic population from the one replayed, so
+the two distributions genuinely differ, and they differ most on the columns
+the two factories build differently: the gate population carries one
+medication row and one condition row in total, so its medication count,
+disorder count, and every flag rate are effectively zero against a
+population where three quarters of patients carry a comorbidity. The
+false-alarm rate is measured over a clean replay where the reference and
+the replayed data come from one frozen population. What this file asserts
+instead is that the comparison discriminates: `prior_inpatient_180d` and
+`days_since_prev_discharge` both sit at p = 1 and `age_at_discharge` at
+0.032, above the floor, so some signals are flagged and others are not. The
+matched case is pinned in the pure tests, where an identical window scores
+a KS statistic of exactly zero, a PSI of exactly zero, and raises nothing.
+
 ## The first reference, 2026-09-08
 
 Built against the frozen baseline and the registry as it stands:

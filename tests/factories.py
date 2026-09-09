@@ -17,6 +17,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from risk_scoring.features import FLAG_CODES
+
 PATIENT_DEFAULTS: dict[str, str] = {
     "Id": "patient-1",
     "BIRTHDATE": "1970-01-01",
@@ -634,3 +636,144 @@ def write_splice_population(csv_dir: Path) -> int:
     write_rows_csv(csv_dir / "medications.csv", medications)
     write_rows_csv(csv_dir / "conditions.csv", conditions)
     return 5
+
+
+MONITORING_START = datetime(2025, 1, 1, tzinfo=UTC)
+"""The training cutoff, so every discharge below is held out from training."""
+
+MONITORING_END = datetime(2025, 4, 1, tzinfo=UTC)
+"""Ninety simulated days: twelve boundaries on a seven-day grid."""
+
+MONITORING_INDEX_STEP = timedelta(hours=16)
+"""One index stay every sixteen hours, which is what sets the window density."""
+
+
+def write_monitoring_population(
+    csv_dir: Path, *, seed: int = 20260101, n_patients: int = 130
+) -> int:
+    """Dense post-cutoff discharges for a monitoring replay; returns the cohort count.
+
+    The populations the other tests replay are shaped for feature isolation
+    or for boundary cases, and neither suits a boundary grid. The skew
+    population scores single digits over four simulated months, and the
+    gate population lives in 2022 and 2023 with a fourteen-month hole
+    between its two encounter clusters, sits entirely inside the training
+    window, and is what the fixture model is fitted on. A window grid over
+    either would mostly read zero.
+
+    So: one index inpatient stay per patient, every sixteen hours from
+    2025-01-01, which puts roughly a dozen discharges in a seven-day
+    window and about fifty-four in a thirty-day one. That is deliberately
+    either side of the recommended minimum count of twenty, so one run
+    exercises both a suppressed window and a full one. The dates start at
+    the training cutoff, so every discharge here is held out.
+
+    Feature values have to vary or the drift statistics are comparing two
+    constants. Ages cycle through ten levels, length of stay through seven,
+    and a hidden per-patient risk coin drives prior emergency visits, the
+    number of active medications, and whether the patient is readmitted, so
+    the scores spread out and the labels carry both classes. Comorbidity
+    codes are drawn from the feature module's own lists by sorted order,
+    never by iterating a frozenset, because string hashing is randomized
+    between processes and the export has to be identical every time.
+
+    A readmission stay is itself an adult inpatient discharge, so it is
+    scored too and counts toward the density. The ones following a late
+    index stay fall past the run's end and are never posted; their labels
+    still come from the export, as ground truth should.
+    """
+    rng = np.random.default_rng(seed)
+    flag_codes = {flag: sorted(codes)[0] for flag, codes in FLAG_CODES.items()}
+    flag_names = sorted(flag_codes)
+
+    patients: list[dict[str, str]] = []
+    encounters: list[dict[str, str]] = []
+    medications: list[dict[str, str]] = []
+    conditions: list[dict[str, str]] = []
+    cohort_rows = 0
+
+    for i in range(n_patients):
+        pid = f"mon{i:04d}"
+        age = (24, 33, 41, 52, 58, 63, 71, 78, 84, 91)[i % 10]
+        patients.append(
+            make_patient_row(
+                Id=pid,
+                BIRTHDATE=f"{2025 - age}-01-01",
+                GENDER="M" if i % 2 else "F",
+            )
+        )
+
+        risky = bool(rng.random() < 0.35)
+        index_start = MONITORING_START + MONITORING_INDEX_STEP * i
+        index_stop = index_start + timedelta(days=1 + i % 7)
+        encounters.append(
+            make_encounter_row(
+                Id=f"mi-{pid}",
+                PATIENT=pid,
+                ENCOUNTERCLASS="inpatient",
+                START=iso_timestamp(index_start),
+                STOP=iso_timestamp(index_stop),
+            )
+        )
+        cohort_rows += 1
+
+        # The learnable signal, and the same one the fixture model was fitted
+        # on: a risky patient probably visited the emergency department first.
+        for visit in range(2 if risky else 1):
+            if rng.random() < (0.8 if risky else 0.2):
+                ed_start = index_start - timedelta(days=15 + 20 * visit)
+                encounters.append(
+                    make_encounter_row(
+                        Id=f"md{visit}-{pid}",
+                        PATIENT=pid,
+                        ENCOUNTERCLASS="emergency",
+                        START=iso_timestamp(ed_start),
+                        STOP=iso_timestamp(ed_start + timedelta(hours=5)),
+                    )
+                )
+
+        for drug in range(3 if risky else 1):
+            medications.append(
+                make_medication_row(
+                    PATIENT=pid,
+                    ENCOUNTER=f"mi-{pid}",
+                    CODE=f"9{drug:05d}",
+                    START=iso_timestamp(index_start - timedelta(days=40 + drug)),
+                    STOP="",
+                )
+            )
+
+        # One comorbidity for most patients, rotating through the seven flag
+        # columns so every proportion test has something on both sides.
+        if i % 4:
+            flag = flag_names[i % len(flag_names)]
+            conditions.append(
+                make_condition_row(
+                    PATIENT=pid,
+                    ENCOUNTER=f"mi-{pid}",
+                    CODE=flag_codes[flag],
+                    DESCRIPTION=f"{flag} (disorder)",
+                    START=(index_start - timedelta(days=200)).strftime("%Y-%m-%d"),
+                    STOP="",
+                )
+            )
+
+        if rng.random() < (0.55 if risky else 0.1):
+            readmit_start = index_stop + timedelta(days=12)
+            encounters.append(
+                make_encounter_row(
+                    Id=f"mr-{pid}",
+                    PATIENT=pid,
+                    ENCOUNTERCLASS="inpatient",
+                    START=iso_timestamp(readmit_start),
+                    STOP=iso_timestamp(readmit_start + timedelta(days=2)),
+                )
+            )
+            cohort_rows += 1
+
+    csv_dir.mkdir(parents=True, exist_ok=True)
+    write_rows_csv(csv_dir / "patients.csv", patients)
+    write_rows_csv(csv_dir / "encounters.csv", encounters)
+    write_rows_csv(csv_dir / "medications.csv", medications)
+    write_rows_csv(csv_dir / "conditions.csv", conditions)
+    return cohort_rows

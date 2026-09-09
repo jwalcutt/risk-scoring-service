@@ -18,6 +18,13 @@ Judgment calls this module fixes:
   than raising: prevalence over nothing, AUROC over one class. A
   monitoring job reads early windows on every evaluation, and an
   exception there would be an error made of a fact.
+- ``released_by`` bounds the join by the instant a label became
+  available, which is what lets a monitoring evaluation be a pure
+  function of its boundary: without it, the same window read later would
+  pick up labels that had not been released yet when the boundary passed,
+  and a run evaluated live and evaluated afterwards would disagree. It is
+  a bound on this join rather than a second join in the monitoring code,
+  because the ``None`` rules above have to hold identically either way.
 """
 
 from __future__ import annotations
@@ -41,15 +48,29 @@ class RealizedPerformance:
 
 
 def realized_performance(
-    conn: psycopg.Connection[Any], start: datetime, end: datetime
+    conn: psycopg.Connection[Any],
+    start: datetime,
+    end: datetime,
+    *,
+    released_by: datetime | None = None,
 ) -> RealizedPerformance:
-    """Count, prevalence, and AUROC over the labelled discharges in ``[start, end)``."""
+    """Count, prevalence, and AUROC over the labelled discharges in ``[start, end)``.
+
+    ``released_by`` restricts the join to labels released at or before that
+    simulated instant, so a caller asking what was known at a boundary gets
+    the same answer whenever it asks.
+    """
     if end <= start:
         raise ValueError(f"the window's start must be before its end; got {start} and {end}")
+    released_clause = "" if released_by is None else " AND l.released_at <= %s"
+    parameters: list[datetime] = [start, end]
+    if released_by is not None:
+        parameters.append(released_by)
     rows = conn.execute(
         "SELECT p.score, l.label FROM predictions AS p JOIN labels AS l USING (prediction_id)"
-        " WHERE p.event_time >= %s AND p.event_time < %s ORDER BY p.prediction_id",
-        [start, end],
+        f" WHERE p.event_time >= %s AND p.event_time < %s{released_clause}"
+        " ORDER BY p.prediction_id",
+        parameters,
     ).fetchall()
     if not rows:
         return RealizedPerformance(count=0, prevalence=None, auroc=None)
