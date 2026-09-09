@@ -15,9 +15,10 @@ Judgment calls this module fixes:
 - Calibration is judged by expected calibration error over equal-count
   bins, threshold 0.05.
 - Subgroups are report-only: four age bands, both sexes (joined from the
-  patients frame), and the seven comorbidity flags. A subgroup with
-  fewer than 50 holdout rows or a single label class has its metrics
-  suppressed with a note; no subgroup moves the verdict.
+  patients frame), and every comorbidity flag the feature pipeline
+  builds. A subgroup with fewer than 50 holdout rows or a single label
+  class has its metrics suppressed with a note; no subgroup moves the
+  verdict.
 - Confidence intervals come from the patient-level bootstrap in
   risk_scoring.evaluation, so every interval respects the patient
   grouping the split was made with.
@@ -48,7 +49,12 @@ from risk_scoring.evaluation import (
     calibration_bins,
     expected_calibration_error,
 )
-from risk_scoring.features import FEATURE_VERSION, MODEL_INPUT_COLUMNS, build_features
+from risk_scoring.features import (
+    FEATURE_VERSION,
+    FLAG_CODES,
+    MODEL_INPUT_COLUMNS,
+    build_features,
+)
 from risk_scoring.labels import LABEL_VERSION, build_labels
 from risk_scoring.populations import load_population
 from risk_scoring.tracking import configure_tracking
@@ -62,15 +68,10 @@ AUROC_REPRODUCTION_TOLERANCE = 1e-6
 
 AGE_BAND_EDGES = (18, 50, 65, 80)
 
-FLAG_COLUMNS = (
-    "flag_chf",
-    "flag_chronic_pulmonary",
-    "flag_dementia",
-    "flag_diabetes",
-    "flag_malignancy",
-    "flag_mi",
-    "flag_renal_disease",
-)
+# Derived from the feature pipeline rather than restated here: a flag
+# added to FLAG_CODES becomes a model input, and the subgroup report has
+# to cover it without anyone remembering to edit this module.
+FLAG_COLUMNS = tuple(FLAG_CODES)
 
 
 @dataclass(frozen=True)
