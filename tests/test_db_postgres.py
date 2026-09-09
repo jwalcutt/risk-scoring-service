@@ -23,6 +23,9 @@ EXPECTED_TABLES = {
     "predictions",
     "replay_runs",
     "labels",
+    "monitoring_reference",
+    "monitoring_evaluations",
+    "alerts",
 }
 
 
